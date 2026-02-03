@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <Optimize>true</Optimize>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="BenchmarkDotNet" Version="0.13.12" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Legio.Core\Legio.Core.csproj" />
+        
+        <ProjectReference Include="..\Legio.Haruspex\Legio.Haruspex.fsproj">
+            <ExcludeAssets>compile</ExcludeAssets>
+        </ProjectReference>
+    </ItemGroup>
+
+</Project>

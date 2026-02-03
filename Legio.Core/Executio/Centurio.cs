@@ -34,7 +34,8 @@ public class Centurio
         {
             Name = $"Centurio_{id}",
             IsBackground = true,
-            Priority = ThreadPriority.AboveNormal 
+
+            Priority = ThreadPriority.Highest 
         };
     }
 
@@ -142,26 +143,5 @@ public class Centurio
         };
         
         _trecenarius.Report(tessera);
-    }
-}
-
-/// <summary>
-/// Temporary static registry to link IDs to actual logic.
-/// Will be managed by Legatus later.
-/// </summary>
-public static class PriorPilusRegistry
-{
-    // Array of delegates or Interfaces
-    public static Action<int, int>[] _commanders = new Action<int, int>[64];
-
-    public static void Register(int id, Action<int, int> executeMethod)
-    {
-        _commanders[id] = executeMethod;
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    public static void ExecuteBatch(int id, int start, int length)
-    {
-        _commanders[id]?.Invoke(start, length);
     }
 }
