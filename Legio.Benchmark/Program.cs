@@ -18,7 +18,13 @@ public class Program
 
         if (args.Length > 0 && args[0].Equals("--stability", StringComparison.OrdinalIgnoreCase))
         {
-            RunSuite(longStabilityMode: true);
+            RunSuite(longStabilityMode: true, onlyHeavy: false);
+            return;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--heavy", StringComparison.OrdinalIgnoreCase))
+        {
+            RunSuite(longStabilityMode: true, onlyHeavy: true);
             return;
         }
 
@@ -26,13 +32,15 @@ public class Program
     }
 
     /// <summary>
-    /// Standalone frame-by-frame game-loop profiler (--quick or --stability).
+    /// Standalone frame-by-frame game-loop profiler (--quick, --stability, or --heavy).
     /// Measures individual frame timings to compute true Mean FPS, 1% Low (P99), 0.1% Low (P99.9),
     /// Max spike, StdDev, GC collections, allocations, Optio steal count, and ML strategy convergence.
     /// </summary>
-    private static void RunSuite(bool longStabilityMode)
+    private static void RunSuite(bool longStabilityMode, bool onlyHeavy = false)
     {
-        string modeLabel = longStabilityMode ? "LONG CONTINUOUS FPS STABILITY PROFILER" : "QUICK VERIFICATION";
+        string modeLabel = onlyHeavy
+            ? "EXTREME CPU/MEMORY TORTURE STABILITY PROFILER (SCENARIOS 7-9)"
+            : (longStabilityMode ? "LONG CONTINUOUS FPS STABILITY PROFILER" : "QUICK VERIFICATION");
         Console.WriteLine($"=== LEGIO {modeLabel} ===");
         Console.WriteLine($"CPU: {Environment.ProcessorCount} logical cores | Stopwatch: {Stopwatch.Frequency / 1_000_000.0:F1} MHz");
         Console.WriteLine();
@@ -40,45 +48,71 @@ public class Program
         int fastFrames   = longStabilityMode ? 1280 : 80;
         int medFrames    = longStabilityMode ? 640  : 50;
         int heavyFrames  = longStabilityMode ? 400  : 32;
+        int brutalFrames = longStabilityMode ? 240  : 20;
         int serialFast   = longStabilityMode ? 64   : 12;
         int serialHeavy  = longStabilityMode ? 24   : 6;
+        int serialBrutal = longStabilityMode ? 10   : 3;
+
+        if (!onlyHeavy)
+        {
+            RunScenario(
+                "1. ECS 3D Particle Physics (65,536 entities, 4 cohorts, 3 DAG phases, 24x cluster skew)",
+                fastFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
+                () => { var s = new EcsParticleSimulation(65_536); return () => s.RunSerial(); },
+                () => { var s = new EcsParticleSimulation(65_536); return () => s.RunParallelFor(); },
+                leg => { var s = new EcsParticleSimulation(65_536); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "2. 3D SDF Raymarching + Soft Shadows (320x180 = 57,600 rays, compute-bound skew)",
+                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 256, stride: 1,
+                () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunSerial(); },
+                () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunParallelFor(); },
+                leg => { var s = new RaymarchSdfSimulation(0, 320, 180); s.Register(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "3. AAA Game-Engine 12-Cohort Pipeline (32k entities + 128/256 micro-cohorts, 6 DAG phases, 10 resources)",
+                fastFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2,
+                () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunSerial(); },
+                () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunParallelFor(); },
+                leg => { var s = new GameEngineDagSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "4. Boids Spatial Flocking (32,768 agents, 5 cohorts, 4 DAG phases, lock-free atomic grid contention)",
+                medFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
+                () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunSerial(); },
+                () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunParallelFor(); },
+                leg => { var s = new BoidsSpatialFlockingSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "5. Multi-Agent A* Maze Pathfinding (2,048 agents, 64x64 maze, 2 DAG phases, ~100x heavy-tailed variance)",
+                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 32, stride: 1,
+                () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunSerial(); },
+                () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunParallelFor(); },
+                leg => { var s = new AStarNavMeshCrowdSimulation(2_048); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunDynamicWaveScenario(longStabilityMode ? 1280 : 256, longStabilityMode ? 128 : 32);
+        }
 
         RunScenario(
-            "1. ECS 3D Particle Physics (65,536 entities, 4 cohorts, 3 DAG phases, 24x cluster skew)",
-            fastFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
-            () => { var s = new EcsParticleSimulation(65_536); return () => s.RunSerial(); },
-            () => { var s = new EcsParticleSimulation(65_536); return () => s.RunParallelFor(); },
-            leg => { var s = new EcsParticleSimulation(65_536); s.RegisterAll(leg); return leg.ExecuteFrame; });
+            "7. Monte Carlo Path Tracing GI (240x135 x 6 SPP x 6 bounces, Fresnel glass + Russian Roulette + 2-phase Denoise)",
+            brutalFrames, serialBrutal, maxCohorts: 4, initialBatch: 128, stride: 1,
+            () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunSerial(); },
+            () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunParallelFor(); },
+            leg => { var s = new MonteCarloPathTracingSimulation(); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
         RunScenario(
-            "2. 3D SDF Raymarching + Soft Shadows (320x180 = 57,600 rays, compute-bound skew)",
-            heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 256, stride: 1,
-            () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunSerial(); },
-            () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunParallelFor(); },
-            leg => { var s = new RaymarchSdfSimulation(0, 320, 180); s.Register(leg); return leg.ExecuteFrame; });
+            "8. Astrophysical O(N^2) N-Body Gravity + Collisions (3,072 bodies = 9.44M pairs/frame, 4 cohorts, 3 DAG phases)",
+            brutalFrames, serialBrutal, maxCohorts: 8, initialBatch: 64, stride: 1,
+            () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunSerial(); },
+            () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunParallelFor(); },
+            leg => { var s = new NBodyGravitySimulation(3_072); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
         RunScenario(
-            "3. AAA Game-Engine 12-Cohort Pipeline (32k entities + 128/256 micro-cohorts, 6 DAG phases, 10 resources)",
-            fastFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2,
-            () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunSerial(); },
-            () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunParallelFor(); },
-            leg => { var s = new GameEngineDagSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
-
-        RunScenario(
-            "4. Boids Spatial Flocking (32,768 agents, 5 cohorts, 4 DAG phases, lock-free atomic grid contention)",
-            medFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
-            () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunSerial(); },
-            () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunParallelFor(); },
-            leg => { var s = new BoidsSpatialFlockingSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
-
-        RunScenario(
-            "5. Multi-Agent A* Maze Pathfinding (2,048 agents, 64x64 maze, 2 DAG phases, ~100x heavy-tailed variance)",
-            heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 32, stride: 1,
-            () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunSerial(); },
-            () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunParallelFor(); },
-            leg => { var s = new AStarNavMeshCrowdSimulation(2_048); s.RegisterAll(leg); return leg.ExecuteFrame; });
-
-        RunDynamicWaveScenario(longStabilityMode ? 1280 : 256, longStabilityMode ? 128 : 32);
+            "9. Cloth PBD 256x256 Red-Black Solver (65,536 vertices, 260k constraints, 10 SEQUENTIAL DAG PHASES/frame!)",
+            medFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2,
+            () => { var s = new ClothVerletPbdSimulation(); return () => s.RunSerial(); },
+            () => { var s = new ClothVerletPbdSimulation(); return () => s.RunParallelFor(); },
+            leg => { var s = new ClothVerletPbdSimulation(); s.RegisterAll(leg); return () => { s.AdvanceWind(); leg.ExecuteFrame(); }; });
     }
 
     private static void RunScenario(
