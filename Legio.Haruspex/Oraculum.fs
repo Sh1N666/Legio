@@ -146,14 +146,12 @@ module private FuzzyMath =
         let maxBatch = max minBatch (min frameItems desiredMaxForStealing)
         struct (minBatch, maxBatch)
 
-    let computeSafeThreads (frameItems: int) (meanUnitNs: float) (cpuPressure: float) (maxThreads: int) (physicalCores: int) : int =
+    let computeSafeThreads (frameItems: int) (meanUnitNs: float) (_cpuPressure: float) (maxThreads: int) (physicalCores: int) : int =
         let estSerialUs = (float frameItems * meanUnitNs) / 1000.0
         if frameItems < 32 || estSerialUs < 60.0 then
             1
         elif estSerialUs < 250.0 then
             min maxThreads (max 2 (physicalCores / 2))
-        elif cpuPressure > 0.92 then
-            min maxThreads (max 1 physicalCores)
         else
             min maxThreads (max 1 (min frameItems maxThreads))
 

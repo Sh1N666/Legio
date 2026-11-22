@@ -208,4 +208,29 @@ public class OraculumTests
         Assert.InRange(currentBatch, 400, 6000);
         Assert.True(strategies[0].Confidence > 0.3f);
     }
+
+    [Theory]
+    [InlineData(OraculumModel.StaticHeuristic)]
+    [InlineData(OraculumModel.FuzzySugeno)]
+    [InlineData(OraculumModel.OrderedFuzzyNumbers)]
+    public void DeterministicModels_KeepFullThreadUtilization_UnderOwnHighProcessCpuLoad(OraculumModel model)
+    {
+        var engine = Oracle.createEngine(4, model, 16, 256);
+        Topologia topo = MakeTopo();
+        var strategies = new Strategia[4];
+        var updated = new byte[4];
+
+        var omens = new Tessera[]
+        {
+            new() { CohortId = 0, CenturioId = 0, ItemCount = 4_000, TotalCohortItems = 57_600, DurationTicks = 2_000_000L, CpuPressure = 0.98f },
+            new() { CohortId = 0, CenturioId = 1, ItemCount = 4_000, TotalCohortItems = 57_600, DurationTicks = 2_500_000L, CpuPressure = 0.98f }
+        };
+
+        for (int step = 0; step < 10; step++)
+        {
+            Array.Clear(updated);
+            engine.Evaluate(in topo, 0.98f, omens, strategies, updated);
+            Assert.Equal(16, strategies[0].ThreadCount);
+        }
+    }
 }
