@@ -308,13 +308,11 @@ public sealed class Centurio : IDisposable
             if (items <= 0)
                 continue;
 
-            int cohortId = slot;
             int totalCohortItems = items;
             for (int k = 0; k < frameItemCount; k++)
             {
                 if (frame.Items[k].CohortSlot == slot)
                 {
-                    cohortId = frame.Items[k].CohortId;
                     totalCohortItems = frame.Items[k].TotalItems;
                     break;
                 }
@@ -326,7 +324,7 @@ public sealed class Centurio : IDisposable
                 ItemCount = items,
                 TotalCohortItems = totalCohortItems,
                 CenturioId = Id,
-                CohortId = cohortId,
+                CohortId = slot,
                 StealCount = phaseSteals,
                 ContentionCount = phaseContentions,
                 CpuPressure = cpuPressure

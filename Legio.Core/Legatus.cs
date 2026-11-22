@@ -60,6 +60,9 @@ public sealed class Legatus : IDisposable
     public int GradusCount => _gradusCount;
     public Topologia Topologia => _topologia;
     public Scriba Scriba => _scriba;
+    public bool IsHaruspexLoaded { get; }
+    public OraculumModel ActiveOracleModel => _config.OracleModel;
+    public long OracleRitualCount => _sanctum.RitualCount;
 
     internal long CurrentEpoch
     {
@@ -90,11 +93,19 @@ public sealed class Legatus : IDisposable
             ? _config.ThreadCount
             : Math.Max(1, _topologia.LogicalCoreCount);
 
-        OraculumFunc oracleDelegate = LoadOraculum();
+        OraculumBatchFunc oracleDelegate = LoadOraculum(threadCount, out bool loadedHaruspex);
+        IsHaruspexLoaded = loadedHaruspex;
 
         _scriba = new Scriba(_config.MaxCohorts, _config.InitialBatchSize, threadCount);
         _trecenarius = new Trecenarius(_config.CirculusCapacity);
-        _sanctum = new Sanctum(_trecenarius, _scriba, oracleDelegate);
+        _sanctum = new Sanctum(
+            trecenarius: _trecenarius,
+            scriba: _scriba,
+            oracleLogic: oracleDelegate,
+            maxCohorts: _config.MaxCohorts,
+            oracleIntervalMs: _config.OracleIntervalMs,
+            cpuMonitorIntervalMs: _config.CpuMonitorIntervalMs,
+            diagnosticSink: _config.DiagnosticSink);
 
         _phaseRing = new PhaseFrame[EpochRingSize];
         for (int i = 0; i < EpochRingSize; i++)
@@ -286,7 +297,7 @@ public sealed class Legatus : IDisposable
             frame.ItemCount = activeItemCount;
             frame.MaxActiveThreads = maxActiveThreads;
             frame.RecordTelemetry = recordTelemetry;
-            frame.CpuPressure = 0f; // Wired to Speculator in Sanctum/Augurium commit.
+            frame.CpuPressure = _sanctum.CurrentCpuPressure;
 
             for (int w = 0; w < maxActiveThreads; w++)
             {
@@ -361,6 +372,8 @@ public sealed class Legatus : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        _sanctum.Dispose();
+
         for (int i = 1; i < _centurions.Length; i++)
         {
             _centurions[i].Dispose();
@@ -372,24 +385,35 @@ public sealed class Legatus : IDisposable
     // AUTO-WIRING LOGIC (REFLECTION)
     // ==========================================
 
-    private OraculumFunc LoadOraculum()
+    private OraculumBatchFunc LoadOraculum(int threadCount, out bool loadedHaruspex)
     {
+        loadedHaruspex = false;
         try
         {
             var assemblyName = new AssemblyName("Legio.Haruspex");
             Assembly assembly = Assembly.Load(assemblyName);
 
             Type? oracleType = assembly.GetType("Legio.Haruspex.Oracle");
-            if (oracleType != null)
+            MethodInfo? createMethod = oracleType?.GetMethod("createEngine", BindingFlags.Public | BindingFlags.Static);
+
+            if (createMethod != null)
             {
-                MethodInfo? divineMethod = oracleType.GetMethod("divine", BindingFlags.Public | BindingFlags.Static);
-                if (divineMethod != null)
+                object? engine = createMethod.Invoke(
+                    null,
+                    new object[] { _config.MaxCohorts, _config.OracleModel, threadCount, _config.InitialBatchSize });
+
+                if (engine != null)
                 {
-                    return (OraculumFunc)Delegate.CreateDelegate(typeof(OraculumFunc), divineMethod);
+                    MethodInfo? evaluateMethod = engine.GetType().GetMethod("Evaluate", BindingFlags.Public | BindingFlags.Instance);
+                    if (evaluateMethod != null)
+                    {
+                        loadedHaruspex = true;
+                        return (OraculumBatchFunc)Delegate.CreateDelegate(typeof(OraculumBatchFunc), engine, evaluateMethod);
+                    }
                 }
             }
 
-            _config.DiagnosticSink?.Invoke("Legio.Haruspex loaded, but Oracle.divine method was not found. Using fallback.");
+            _config.DiagnosticSink?.Invoke("Legio.Haruspex loaded, but Oracle.createEngine/Evaluate was not found. Using fallback.");
         }
         catch (Exception ex)
         {
@@ -399,14 +423,31 @@ public sealed class Legatus : IDisposable
         return FallbackOraculum;
     }
 
-    private static Strategia FallbackOraculum(Topologia topo, ReadOnlySpan<Tessera> omens)
+    private void FallbackOraculum(
+        in Topologia topo,
+        float cpuPressure,
+        ReadOnlySpan<Tessera> omens,
+        Span<Strategia> strategiesOut,
+        Span<byte> updatedMask)
     {
-        return new Strategia
+        int threads = Math.Clamp(_centurions?.Length ?? topo.LogicalCoreCount, 1, Math.Max(1, topo.LogicalCoreCount));
+        var fallback = new Strategia
         {
-            BatchSize = 1024,
-            ThreadCount = Math.Max(1, topo.LogicalCoreCount),
+            BatchSize = Math.Max(16, _config.InitialBatchSize),
+            ThreadCount = threads,
             Confidence = 0.5f,
-            AffinityHint = 0
+            AffinityHint = cpuPressure > 0.85f ? 1 : 0
         };
+
+        int limit = Math.Min(strategiesOut.Length, updatedMask.Length);
+        for (int i = 0; i < omens.Length; i++)
+        {
+            int c = omens[i].CohortId;
+            if ((uint)c < (uint)limit && updatedMask[c] == 0)
+            {
+                strategiesOut[c] = fallback;
+                updatedMask[c] = 1;
+            }
+        }
     }
 }
