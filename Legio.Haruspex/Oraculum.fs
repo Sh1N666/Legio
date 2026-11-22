@@ -165,8 +165,9 @@ module private FuzzyMath =
 type OraculumEngine(maxCohorts: int, model: OraculumModel, maxThreads: int, initialBatchSize: int) =
 
     static let BanditArmCount = 8
-    static let BanditChunksPerThread = [| 2.0; 4.0; 8.0; 16.0; 32.0; 4.0; 8.0; 16.0 |]
-    static let BanditThreadRatio     = [| 1.0; 1.0; 1.0;  1.0;  1.0; 0.5; 0.5;  0.75 |]
+    // Context-aware arms: target batch duration (us) paired with thread-count scaling factor.
+    static let BanditTargetUs    = [| 50.0; 100.0; 200.0; 400.0; 800.0; 120.0; 250.0; 500.0 |]
+    static let BanditThreadRatio = [|  1.0;   1.0;   1.0;   1.0;   1.0;   0.5;   0.5;  0.75 |]
 
     let _maxCohorts = max 1 maxCohorts
     let _maxThreads = max 1 maxThreads
@@ -375,10 +376,10 @@ type OraculumEngine(maxCohorts: int, model: OraculumModel, maxThreads: int, init
     // =========================================================================
     // MODEL 3: ContextualBandit (Zero-Allocation Discounted UCB1)
     // =========================================================================
-    let evaluateBandit c frameItems meanUnitNs pressure throughput logicalCores physicalCores =
+    let evaluateBandit c frameItems meanUnitNs imbalance pressure throughput logicalCores physicalCores =
         let mutable st = _banditStates.[c]
         let baseIdx = c * BanditArmCount
-        let gamma = 0.90
+        let gamma = 0.96
 
         let reward = Math.Log(1.0 + max 0.0 throughput)
         if reward > st.BestRewardScale then
@@ -393,32 +394,29 @@ type OraculumEngine(maxCohorts: int, model: OraculumModel, maxThreads: int, init
             _banditCounts.[baseIdx + prev]  <- _banditCounts.[baseIdx + prev] + 1.0
             _banditRewards.[baseIdx + prev] <- _banditRewards.[baseIdx + prev] + reward
 
-        st.TotalUpdates <- st.TotalUpdates + 1
-
         let mutable totalN = 0.0
         for a = 0 to BanditArmCount - 1 do
             totalN <- totalN + _banditCounts.[baseIdx + a]
 
-        let logTotal = Math.Log(max 1.0 totalN + 1.0)
-        let exploreC = 0.6 * max 1.0 st.BestRewardScale
-
         let mutable chosenArm = 0
-        let mutable bestScore = Double.NegativeInfinity
-        let mutable foundUnexplored = false
+        if st.TotalUpdates < BanditArmCount then
+            // Initial round-robin sweep: evaluate each arm once before UCB exploitation begins.
+            chosenArm <- st.TotalUpdates
+        else
+            let logTotal = Math.Log(max 1.0 totalN + 1.0)
+            // Log-throughput rewards span ~0.1..2.0 across arms, so constant exploration factor 0.35 balances explore/exploit cleanly.
+            let exploreC = 0.35
+            let mutable bestScore = Double.NegativeInfinity
 
-        for a = 0 to BanditArmCount - 1 do
-            if not foundUnexplored then
-                let n = _banditCounts.[baseIdx + a]
-                if n < 0.5 then
+            for a = 0 to BanditArmCount - 1 do
+                let n = max 0.05 _banditCounts.[baseIdx + a]
+                let meanR = _banditRewards.[baseIdx + a] / n
+                let ucb = meanR + exploreC * Math.Sqrt(logTotal / n)
+                if ucb > bestScore then
+                    bestScore <- ucb
                     chosenArm <- a
-                    foundUnexplored <- true
-                else
-                    let meanR = _banditRewards.[baseIdx + a] / n
-                    let ucb = meanR + exploreC * Math.Sqrt(logTotal / n)
-                    if ucb > bestScore then
-                        bestScore <- ucb
-                        chosenArm <- a
 
+        st.TotalUpdates <- st.TotalUpdates + 1
         st.LastArm <- chosenArm
         _banditStates.[c] <- st
 
@@ -427,10 +425,13 @@ type OraculumEngine(maxCohorts: int, model: OraculumModel, maxThreads: int, init
             if baseThreads <= 1 then 1
             else max 1 (min logicalCores (int (Math.Round(float baseThreads * BanditThreadRatio.[chosenArm]))))
 
-        let targetChunks = BanditChunksPerThread.[chosenArm] * float armThreads
-        let rawBatch = float frameItems / max 1.0 targetChunks
+        // Context-aware translation: target batch duration scaled down smoothly by observed imbalance.
+        let skewScale = 1.0 / max 1.0 (sqrt imbalance)
+        let targetUs = BanditTargetUs.[chosenArm] * skewScale
+        let rawBatch = (targetUs * 1000.0) / max 0.01 meanUnitNs
         let struct (minB, maxB) = FuzzyMath.computeBatchBounds frameItems armThreads
-        let batch = FuzzyMath.safeToInt rawBatch minB maxB
+        let minQueueGuard = max minB (frameItems / max 1 (armThreads * 64))
+        let batch = FuzzyMath.safeToInt (max rawBatch (float minQueueGuard)) minB maxB
 
         let armShare =
             if totalN > 1.0 then _banditCounts.[baseIdx + chosenArm] / totalN
@@ -537,7 +538,7 @@ type OraculumEngine(maxCohorts: int, model: OraculumModel, maxThreads: int, init
                         | OraculumModel.OrderedFuzzyNumbers ->
                             evaluateOfn c frameItems meanUnitNs w.MinUnitNs w.MaxUnitNs imbalance contentionRate pressure throughput logicalCores physicalCores
                         | OraculumModel.ContextualBandit ->
-                            evaluateBandit c frameItems meanUnitNs pressure throughput logicalCores physicalCores
+                            evaluateBandit c frameItems meanUnitNs imbalance pressure throughput logicalCores physicalCores
                         | _ ->
                             evaluateStaticHeuristic frameItems meanUnitNs imbalance pressure logicalCores physicalCores
 
