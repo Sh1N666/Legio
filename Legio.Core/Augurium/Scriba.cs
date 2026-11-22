@@ -1,68 +1,114 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Legio.Protocol;
 
 namespace Legio.Core.Augurium;
 
 /// <summary>
 /// Scriba (The Scribe).
-/// Acts as the atomic bridge between the Execution Layer (C#) and the Oracle (F#).
-/// Uses a Double-Buffering technique to allow lock-free reading of the current strategy.
+/// Lock-free, zero-allocation per-Cohort strategy table using a SeqLock per 64-byte padded slot.
+/// Guarantees 100% tear-free reads of the 16-byte Strategia struct without locks or heap allocations.
 /// </summary>
-public unsafe class Scriba
+public sealed class Scriba
 {
-    // Backing store for strategies.
-    // Index 0 and 1 are swapped atomically.
-    private readonly Strategia[] _buffer;
-    
-    // Points to the currently active strategy index (0 or 1).
-    private volatile int _activeIndex;
-
-    public Scriba()
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct StrategySlot
     {
-        _buffer = new Strategia[2];
-        _activeIndex = 0;
+        // Even = stable, Odd = write in progress.
+        [FieldOffset(0)]
+        public long Sequence;
 
-        // Default conservative strategy to ensure safety before the first Oracle prediction.
-        var defaultStrat = new Strategia
+        [FieldOffset(8)]
+        public Strategia Value;
+    }
+
+    private readonly StrategySlot[] _slots;
+
+    public int Capacity => _slots.Length;
+
+    public Scriba(int maxCohorts = 64, int defaultBatchSize = 1024, int defaultThreadCount = 0)
+    {
+        if (maxCohorts <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxCohorts), "MaxCohorts must be positive.");
+
+        int threads = defaultThreadCount > 0 ? defaultThreadCount : Math.Max(1, Environment.ProcessorCount);
+        int batch = Math.Max(16, defaultBatchSize);
+
+        var defaultStrategy = new Strategia
         {
-            BatchSize = 1024,
-            ThreadCount = Environment.ProcessorCount,
+            BatchSize = batch,
+            ThreadCount = threads,
             Confidence = 0.5f,
             AffinityHint = 0
         };
 
-        _buffer[0] = defaultStrat;
-        _buffer[1] = defaultStrat;
+        _slots = new StrategySlot[maxCohorts];
+        for (int i = 0; i < maxCohorts; i++)
+        {
+            _slots[i].Sequence = 0;
+            _slots[i].Value = defaultStrategy;
+        }
     }
 
     /// <summary>
-    /// Reads the current Battle Strategy.
-    /// Called frequently by Prior Pilus (hot path).
-    /// Zero allocation, wait-free.
+    /// Reads the current strategy for a specific cohort slot (wait-free under no concurrent write,
+    /// guaranteed tear-free via SeqLock, zero allocations).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Strategia Legere()
+    public Strategia Legere(int cohortSlot = 0)
     {
-        // Simple array access is atomic enough for reading a struct in this context
-        // as long as we trust the index.
-        return _buffer[_activeIndex];
+        if ((uint)cohortSlot >= (uint)_slots.Length)
+            cohortSlot = 0;
+
+        ref StrategySlot slot = ref _slots[cohortSlot];
+
+        while (true)
+        {
+            long seq1 = Volatile.Read(ref slot.Sequence);
+            if ((seq1 & 1L) != 0)
+            {
+                Thread.SpinWait(1);
+                continue;
+            }
+
+            Strategia copy = slot.Value;
+
+            // Prevent reading seq2 before copying all 16 bytes of Strategia (critical on ARM64 and JIT).
+            Interlocked.MemoryBarrier();
+            long seq2 = Volatile.Read(ref slot.Sequence);
+
+            if (seq1 == seq2)
+                return copy;
+        }
     }
 
     /// <summary>
-    /// Publishes a new strategy from the Oracle.
-    /// Called by the Trecenarius/Sancti thread (cold path).
+    /// Publishes a new strategy for a specific cohort slot. Single writer (Sanctum thread).
     /// </summary>
-    public void Scribere(Strategia novaStrategia)
+    public void Scribere(int cohortSlot, in Strategia novaStrategia)
     {
-        // Determine the "back" buffer (the one NOT currently being read)
-        int backBufferIndex = (_activeIndex + 1) & 1; // Toggle 0 <-> 1
+        if ((uint)cohortSlot >= (uint)_slots.Length)
+            return;
 
-        // Write the new data to the back buffer
-        _buffer[backBufferIndex] = novaStrategia;
+        ref StrategySlot slot = ref _slots[cohortSlot];
+        long seq = slot.Sequence;
 
-        // Atomic swap: Point active index to the new buffer.
-        // MemoryBarrier is implicitly handled by Interlocked or Volatile Write in .NET Core.
-        // We use Exchange to ensure immediate visibility.
-        Interlocked.Exchange(ref _activeIndex, backBufferIndex);
+        // Odd sequence signals write-in-progress with full barrier before mutating Value.
+        Interlocked.Exchange(ref slot.Sequence, seq + 1);
+        slot.Value = novaStrategia;
+
+        // Release store to even sequence makes the new Value atomically visible.
+        Volatile.Write(ref slot.Sequence, seq + 2);
+    }
+
+    /// <summary>
+    /// Broadcasts a strategy to all slots (compatibility helper for global fallback).
+    /// </summary>
+    public void ScribereAll(in Strategia novaStrategia)
+    {
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            Scribere(i, in novaStrategia);
+        }
     }
 }

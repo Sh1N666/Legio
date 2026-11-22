@@ -3,26 +3,29 @@ using System.Runtime.InteropServices;
 namespace Legio.Core.Executio;
 
 /// <summary>
-/// A raw description of a work unit (Centuria) to be processed.
-/// Blittable struct used inside the Work Stealing Deque.
-/// It doesn't hold the Job logic, only the Data coordinates.
+/// A raw, 16-byte blittable description of a work chunk (Centuria) inside an Optio deque.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct TaskUnit
 {
     /// <summary>
-    /// Index of the Prior Pilus (Cohort Commander) who owns this task.
-    /// The Centurion will callback this commander to execute the specific logic.
+    /// Internal slot index of the Cohort/Commander inside Legatus.
     /// </summary>
-    public int PriorPilusId;
+    public int CohortSlot;
 
     /// <summary>
-    /// Start index in the memory buffer (Manipulus).
+    /// Start element index in the target data buffer.
     /// </summary>
     public int Start;
 
     /// <summary>
-    /// Number of elements to process.
+    /// Number of elements to process in this chunk.
     /// </summary>
     public int Length;
+
+    /// <summary>
+    /// Ring slot (epoch & 7) of the PhaseFrame that owns this chunk.
+    /// Ensures completion accounting always credits the exact owning phase.
+    /// </summary>
+    public int PhaseSlot;
 }

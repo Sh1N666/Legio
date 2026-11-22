@@ -61,7 +61,7 @@ public class Sanctum
                 Strategia prediction = _oracleLogic(topology, omens);
 
                 // 4. Inscribe the new strategy for the Legion
-                _scriba.Scribere(prediction);
+                _scriba.ScribereAll(in prediction);
             }
 
             // 5. Meditate
