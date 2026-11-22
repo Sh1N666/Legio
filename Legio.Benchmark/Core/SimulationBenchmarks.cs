@@ -41,29 +41,31 @@ public class EcsParticleBenchmark
     [Params(65_536)]
     public int ParticleCount;
 
-    private EcsParticleSimulation _serialSim = null!;
-    private EcsParticleSimulation _parallelSim = null!;
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    private EcsParticleSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new EcsParticleSimulation(ParticleCount);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new EcsParticleSimulation(ParticleCount);
-        _parallelSim = new EcsParticleSimulation(ParticleCount);
-
-        _staticLegatus = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        _fuzzySugenoLegatus = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        _ofnLegatus = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        _banditLegatus = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private Legatus CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new EcsParticleSimulation(ParticleCount);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new EcsParticleSimulation(ParticleCount);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 8,
             OracleModel = model,
@@ -72,41 +74,35 @@ public class EcsParticleBenchmark
             InitialBatchSize = 512
         });
 
-        sim.RegisterAll(legatus);
-
-        for (int i = 0; i < 16; i++) legatus.ExecuteFrame();
-        Thread.Sleep(120);
-        for (int i = 0; i < 8; i++) legatus.ExecuteFrame();
-
-        return legatus;
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 16; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 8; i++) _legatus.ExecuteFrame();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial() => _serialSim.RunSerial();
+    public void Serial() => _sim.RunSerial();
 
     [Benchmark]
-    public void Parallel_For() => _parallelSim.RunParallelFor();
+    public void Parallel_For() => _sim.RunParallelFor();
 
     [Benchmark]
-    public void Legio_StaticHeuristic() => _staticLegatus.ExecuteFrame();
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_FuzzySugeno() => _fuzzySugenoLegatus.ExecuteFrame();
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers() => _ofnLegatus.ExecuteFrame();
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_ContextualBandit() => _banditLegatus.ExecuteFrame();
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -115,29 +111,31 @@ public class EcsParticleBenchmark
 [Config(typeof(LegioExtendedConfig))]
 public class RaymarchSdfBenchmark
 {
-    private RaymarchSdfSimulation _serialSim = null!;
-    private RaymarchSdfSimulation _parallelSim = null!;
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    private RaymarchSdfSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new RaymarchSdfSimulation(0, width: 320, height: 180);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new RaymarchSdfSimulation(0, width: 320, height: 180);
-        _parallelSim = new RaymarchSdfSimulation(0, width: 320, height: 180);
-
-        _staticLegatus = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        _fuzzySugenoLegatus = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        _ofnLegatus = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        _banditLegatus = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private Legatus CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new RaymarchSdfSimulation(0, width: 320, height: 180);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new RaymarchSdfSimulation(0, width: 320, height: 180);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 4,
             OracleModel = model,
@@ -146,41 +144,35 @@ public class RaymarchSdfBenchmark
             InitialBatchSize = 256
         });
 
-        sim.Register(legatus);
-
-        for (int i = 0; i < 8; i++) legatus.ExecuteFrame();
-        Thread.Sleep(120);
-        for (int i = 0; i < 4; i++) legatus.ExecuteFrame();
-
-        return legatus;
+        _sim.Register(_legatus);
+        for (int i = 0; i < 8; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 4; i++) _legatus.ExecuteFrame();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial() => _serialSim.RunSerial();
+    public void Serial() => _sim.RunSerial();
 
     [Benchmark]
-    public void Parallel_For() => _parallelSim.RunParallelFor();
+    public void Parallel_For() => _sim.RunParallelFor();
 
     [Benchmark]
-    public void Legio_StaticHeuristic() => _staticLegatus.ExecuteFrame();
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_FuzzySugeno() => _fuzzySugenoLegatus.ExecuteFrame();
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers() => _ofnLegatus.ExecuteFrame();
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_ContextualBandit() => _banditLegatus.ExecuteFrame();
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -190,29 +182,31 @@ public class RaymarchSdfBenchmark
 [Config(typeof(LegioExtendedConfig))]
 public class GameEngineDagBenchmark
 {
-    private GameEngineDagSimulation _serialSim = null!;
-    private GameEngineDagSimulation _parallelSim = null!;
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    private GameEngineDagSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new GameEngineDagSimulation(32_768);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new GameEngineDagSimulation(32_768);
-        _parallelSim = new GameEngineDagSimulation(32_768);
-
-        _staticLegatus = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        _fuzzySugenoLegatus = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        _ofnLegatus = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        _banditLegatus = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private Legatus CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new GameEngineDagSimulation(32_768);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new GameEngineDagSimulation(32_768);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 16,
             OracleModel = model,
@@ -221,41 +215,35 @@ public class GameEngineDagBenchmark
             InitialBatchSize = 512
         });
 
-        sim.RegisterAll(legatus);
-
-        for (int i = 0; i < 16; i++) legatus.ExecuteFrame();
-        Thread.Sleep(120);
-        for (int i = 0; i < 8; i++) legatus.ExecuteFrame();
-
-        return legatus;
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 16; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 8; i++) _legatus.ExecuteFrame();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial() => _serialSim.RunSerial();
+    public void Serial() => _sim.RunSerial();
 
     [Benchmark]
-    public void Parallel_For() => _parallelSim.RunParallelFor();
+    public void Parallel_For() => _sim.RunParallelFor();
 
     [Benchmark]
-    public void Legio_StaticHeuristic() => _staticLegatus.ExecuteFrame();
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_FuzzySugeno() => _fuzzySugenoLegatus.ExecuteFrame();
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers() => _ofnLegatus.ExecuteFrame();
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_ContextualBandit() => _banditLegatus.ExecuteFrame();
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -265,29 +253,31 @@ public class GameEngineDagBenchmark
 [Config(typeof(LegioExtendedConfig))]
 public class BoidsSpatialFlockingBenchmark
 {
-    private BoidsSpatialFlockingSimulation _serialSim = null!;
-    private BoidsSpatialFlockingSimulation _parallelSim = null!;
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    private BoidsSpatialFlockingSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new BoidsSpatialFlockingSimulation(32_768);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new BoidsSpatialFlockingSimulation(32_768);
-        _parallelSim = new BoidsSpatialFlockingSimulation(32_768);
-
-        _staticLegatus = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        _fuzzySugenoLegatus = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        _ofnLegatus = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        _banditLegatus = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private Legatus CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new BoidsSpatialFlockingSimulation(32_768);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new BoidsSpatialFlockingSimulation(32_768);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 8,
             OracleModel = model,
@@ -296,41 +286,35 @@ public class BoidsSpatialFlockingBenchmark
             InitialBatchSize = 512
         });
 
-        sim.RegisterAll(legatus);
-
-        for (int i = 0; i < 16; i++) legatus.ExecuteFrame();
-        Thread.Sleep(120);
-        for (int i = 0; i < 8; i++) legatus.ExecuteFrame();
-
-        return legatus;
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 16; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 8; i++) _legatus.ExecuteFrame();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial() => _serialSim.RunSerial();
+    public void Serial() => _sim.RunSerial();
 
     [Benchmark]
-    public void Parallel_For() => _parallelSim.RunParallelFor();
+    public void Parallel_For() => _sim.RunParallelFor();
 
     [Benchmark]
-    public void Legio_StaticHeuristic() => _staticLegatus.ExecuteFrame();
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_FuzzySugeno() => _fuzzySugenoLegatus.ExecuteFrame();
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers() => _ofnLegatus.ExecuteFrame();
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_ContextualBandit() => _banditLegatus.ExecuteFrame();
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -340,29 +324,31 @@ public class BoidsSpatialFlockingBenchmark
 [Config(typeof(LegioExtendedConfig))]
 public class AStarNavMeshCrowdBenchmark
 {
-    private AStarNavMeshCrowdSimulation _serialSim = null!;
-    private AStarNavMeshCrowdSimulation _parallelSim = null!;
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    private AStarNavMeshCrowdSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new AStarNavMeshCrowdSimulation(2_048);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new AStarNavMeshCrowdSimulation(2_048);
-        _parallelSim = new AStarNavMeshCrowdSimulation(2_048);
-
-        _staticLegatus = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        _fuzzySugenoLegatus = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        _ofnLegatus = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        _banditLegatus = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private Legatus CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new AStarNavMeshCrowdSimulation(2_048);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new AStarNavMeshCrowdSimulation(2_048);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 4,
             OracleModel = model,
@@ -371,41 +357,35 @@ public class AStarNavMeshCrowdBenchmark
             InitialBatchSize = 32
         });
 
-        sim.RegisterAll(legatus);
-
-        for (int i = 0; i < 8; i++) legatus.ExecuteFrame();
-        Thread.Sleep(120);
-        for (int i = 0; i < 4; i++) legatus.ExecuteFrame();
-
-        return legatus;
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 8; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 4; i++) _legatus.ExecuteFrame();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial() => _serialSim.RunSerial();
+    public void Serial() => _sim.RunSerial();
 
     [Benchmark]
-    public void Parallel_For() => _parallelSim.RunParallelFor();
+    public void Parallel_For() => _sim.RunParallelFor();
 
     [Benchmark]
-    public void Legio_StaticHeuristic() => _staticLegatus.ExecuteFrame();
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_FuzzySugeno() => _fuzzySugenoLegatus.ExecuteFrame();
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers() => _ofnLegatus.ExecuteFrame();
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
 
     [Benchmark]
-    public void Legio_ContextualBandit() => _banditLegatus.ExecuteFrame();
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -416,34 +396,31 @@ public class AStarNavMeshCrowdBenchmark
 [Config(typeof(LegioExtendedConfig))]
 public class DynamicLoadWaveBenchmark
 {
-    private DynamicLoadWaveSimulation _serialSim = null!;
-    private DynamicLoadWaveSimulation _parallelSim = null!;
-    private DynamicLoadWaveSimulation _staticSim = null!;
-    private DynamicLoadWaveSimulation _fuzzySim = null!;
-    private DynamicLoadWaveSimulation _ofnSim = null!;
-    private DynamicLoadWaveSimulation _banditSim = null!;
+    private DynamicLoadWaveSimulation _sim = null!;
+    private Legatus? _legatus;
 
-    private Legatus _staticLegatus = null!;
-    private Legatus _fuzzySugenoLegatus = null!;
-    private Legatus _ofnLegatus = null!;
-    private Legatus _banditLegatus = null!;
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new DynamicLoadWaveSimulation(49_152);
 
-    [GlobalSetup]
-    public void Setup()
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
     {
-        _serialSim = new DynamicLoadWaveSimulation(49_152);
-        _parallelSim = new DynamicLoadWaveSimulation(49_152);
-
-        (_staticSim, _staticLegatus) = CreateAndWarmup(OraculumModel.StaticHeuristic);
-        (_fuzzySim, _fuzzySugenoLegatus) = CreateAndWarmup(OraculumModel.FuzzySugeno);
-        (_ofnSim, _ofnLegatus) = CreateAndWarmup(OraculumModel.OrderedFuzzyNumbers);
-        (_banditSim, _banditLegatus) = CreateAndWarmup(OraculumModel.ContextualBandit);
-    }
-
-    private static (DynamicLoadWaveSimulation, Legatus) CreateAndWarmup(OraculumModel model)
-    {
-        var sim = new DynamicLoadWaveSimulation(49_152);
-        var legatus = new Legatus(new LegatusConfig
+        _sim = new DynamicLoadWaveSimulation(49_152);
+        _legatus = new Legatus(new LegatusConfig
         {
             MaxCohorts = 8,
             OracleModel = model,
@@ -452,65 +429,35 @@ public class DynamicLoadWaveBenchmark
             InitialBatchSize = 512
         });
 
-        sim.RegisterAll(legatus);
-
-        for (int i = 0; i < 32; i++) { sim.AdvanceFrameTick(); legatus.ExecuteFrame(); }
-        Thread.Sleep(120);
-        sim.ResetWave();
-
-        return (sim, legatus);
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 32; i++) { _sim.AdvanceFrameTick(); _legatus.ExecuteFrame(); }
+        Thread.Sleep(110);
+        _sim.ResetWave();
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _staticLegatus.Dispose();
-        _fuzzySugenoLegatus.Dispose();
-        _ofnLegatus.Dispose();
-        _banditLegatus.Dispose();
-    }
+    public void Cleanup() => _legatus?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void Serial()
-    {
-        _serialSim.AdvanceFrameTick();
-        _serialSim.RunSerial();
-    }
+    public void Serial() { _sim.AdvanceFrameTick(); _sim.RunSerial(); }
 
     [Benchmark]
-    public void Parallel_For()
-    {
-        _parallelSim.AdvanceFrameTick();
-        _parallelSim.RunParallelFor();
-    }
+    public void Parallel_For() { _sim.AdvanceFrameTick(); _sim.RunParallelFor(); }
 
     [Benchmark]
-    public void Legio_StaticHeuristic()
-    {
-        _staticSim.AdvanceFrameTick();
-        _staticLegatus.ExecuteFrame();
-    }
+    public void Legio_StaticHeuristic() { _sim.AdvanceFrameTick(); _legatus!.ExecuteFrame(); }
 
     [Benchmark]
-    public void Legio_FuzzySugeno()
-    {
-        _fuzzySim.AdvanceFrameTick();
-        _fuzzySugenoLegatus.ExecuteFrame();
-    }
+    public void Legio_FuzzySugeno() { _sim.AdvanceFrameTick(); _legatus!.ExecuteFrame(); }
 
     [Benchmark]
-    public void Legio_OrderedFuzzyNumbers()
-    {
-        _ofnSim.AdvanceFrameTick();
-        _ofnLegatus.ExecuteFrame();
-    }
+    public void Legio_OrderedFuzzyNumbers() { _sim.AdvanceFrameTick(); _legatus!.ExecuteFrame(); }
 
     [Benchmark]
-    public void Legio_ContextualBandit()
-    {
-        _banditSim.AdvanceFrameTick();
-        _banditLegatus.ExecuteFrame();
-    }
+    public void Legio_ContextualBandit() { _sim.AdvanceFrameTick(); _legatus!.ExecuteFrame(); }
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() { _sim.AdvanceFrameTick(); _legatus!.ExecuteFrame(); }
 }
 
 /// <summary>
@@ -537,6 +484,9 @@ public class MonteCarloPathTracingBenchmark
 
     [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
     public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
 
     private void SetupLegio(OraculumModel model)
     {
@@ -576,6 +526,9 @@ public class MonteCarloPathTracingBenchmark
 
     [Benchmark]
     public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -602,6 +555,9 @@ public class NBodyGravityBenchmark
 
     [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
     public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
 
     private void SetupLegio(OraculumModel model)
     {
@@ -641,6 +597,9 @@ public class NBodyGravityBenchmark
 
     [Benchmark]
     public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }
 
 /// <summary>
@@ -667,6 +626,9 @@ public class ClothVerletPbdBenchmark
 
     [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
     public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
 
     private void SetupLegio(OraculumModel model)
     {
@@ -706,4 +668,149 @@ public class ClothVerletPbdBenchmark
 
     [Benchmark]
     public void Legio_ContextualBandit() { _sim.AdvanceWind(); _legatus!.ExecuteFrame(); }
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() { _sim.AdvanceWind(); _legatus!.ExecuteFrame(); }
+}
+
+/// <summary>
+/// 10. Mega-Brutal 3D SPH Dam-Break Fluid Simulation (12,288 particles, 6 cohorts, 5 DAG phases,
+///     27-cell linked-list L3 cache gather thrashing + extreme corner density spatial clustering).
+/// </summary>
+[Config(typeof(LegioExtendedConfig))]
+public class FluidSphBenchmark
+{
+    private FluidSphSimulation _sim = null!;
+    private Legatus? _legatus;
+
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new FluidSphSimulation(12_288);
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
+    {
+        _sim = new FluidSphSimulation(12_288);
+        _legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 8,
+            OracleModel = model,
+            OracleIntervalMs = 80,
+            TelemetrySampleStride = 1,
+            InitialBatchSize = 128
+        });
+
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 6; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 4; i++) _legatus.ExecuteFrame();
+    }
+
+    [GlobalCleanup]
+    public void Cleanup() => _legatus?.Dispose();
+
+    [Benchmark(Baseline = true)]
+    public void Serial() => _sim.RunSerial();
+
+    [Benchmark]
+    public void Parallel_For() => _sim.RunParallelFor();
+
+    [Benchmark]
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
+}
+
+/// <summary>
+/// 11. Mega-Brutal Double-Precision Deep-Zoom Mandelbrot Fractal (384x216 = 82,944 pixels, up to 2,048 iter/px,
+///     ~500x asymmetric spatial skew on the cardioid/Seahorse boundary + 2-phase Sobel/Exposure DAG).
+/// </summary>
+[Config(typeof(LegioExtendedConfig))]
+public class MandelbrotDeepZoomBenchmark
+{
+    private MandelbrotDeepZoomSimulation _sim = null!;
+    private Legatus? _legatus;
+
+    [GlobalSetup(Targets = [nameof(Serial), nameof(Parallel_For)])]
+    public void SetupBaseline() => _sim = new MandelbrotDeepZoomSimulation();
+
+    [GlobalSetup(Target = nameof(Legio_StaticHeuristic))]
+    public void SetupStatic() => SetupLegio(OraculumModel.StaticHeuristic);
+
+    [GlobalSetup(Target = nameof(Legio_FuzzySugeno))]
+    public void SetupFuzzy() => SetupLegio(OraculumModel.FuzzySugeno);
+
+    [GlobalSetup(Target = nameof(Legio_OrderedFuzzyNumbers))]
+    public void SetupOfn() => SetupLegio(OraculumModel.OrderedFuzzyNumbers);
+
+    [GlobalSetup(Target = nameof(Legio_ContextualBandit))]
+    public void SetupBandit() => SetupLegio(OraculumModel.ContextualBandit);
+
+    [GlobalSetup(Target = nameof(Legio_OnlineLinUcb))]
+    public void SetupLinUcb() => SetupLegio(OraculumModel.OnlineLinUcb);
+
+    private void SetupLegio(OraculumModel model)
+    {
+        _sim = new MandelbrotDeepZoomSimulation();
+        _legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            OracleModel = model,
+            OracleIntervalMs = 80,
+            TelemetrySampleStride = 1,
+            InitialBatchSize = 256
+        });
+
+        _sim.RegisterAll(_legatus);
+        for (int i = 0; i < 6; i++) _legatus.ExecuteFrame();
+        Thread.Sleep(110);
+        for (int i = 0; i < 4; i++) _legatus.ExecuteFrame();
+    }
+
+    [GlobalCleanup]
+    public void Cleanup() => _legatus?.Dispose();
+
+    [Benchmark(Baseline = true)]
+    public void Serial() => _sim.RunSerial();
+
+    [Benchmark]
+    public void Parallel_For() => _sim.RunParallelFor();
+
+    [Benchmark]
+    public void Legio_StaticHeuristic() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_FuzzySugeno() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OrderedFuzzyNumbers() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_ContextualBandit() => _legatus!.ExecuteFrame();
+
+    [Benchmark]
+    public void Legio_OnlineLinUcb() => _legatus!.ExecuteFrame();
 }

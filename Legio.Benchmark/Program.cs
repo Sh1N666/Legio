@@ -12,19 +12,25 @@ public class Program
     {
         if (args.Length > 0 && args[0].Equals("--quick", StringComparison.OrdinalIgnoreCase))
         {
-            RunSuite(longStabilityMode: false);
+            RunSuite(mode: "quick");
             return;
         }
 
         if (args.Length > 0 && args[0].Equals("--stability", StringComparison.OrdinalIgnoreCase))
         {
-            RunSuite(longStabilityMode: true, onlyHeavy: false);
+            RunSuite(mode: "stability");
             return;
         }
 
         if (args.Length > 0 && args[0].Equals("--heavy", StringComparison.OrdinalIgnoreCase))
         {
-            RunSuite(longStabilityMode: true, onlyHeavy: true);
+            RunSuite(mode: "heavy");
+            return;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--new", StringComparison.OrdinalIgnoreCase))
+        {
+            RunSuite(mode: "new");
             return;
         }
 
@@ -32,87 +38,126 @@ public class Program
     }
 
     /// <summary>
-    /// Standalone frame-by-frame game-loop profiler (--quick, --stability, or --heavy).
-    /// Measures individual frame timings to compute true Mean FPS, 1% Low (P99), 0.1% Low (P99.9),
-    /// Max spike, StdDev, GC collections, allocations, Optio steal count, and ML strategy convergence.
+    /// Standalone frame-by-frame game-loop profiler (--quick, --stability, --heavy, or --new).
+    /// Measures individual frame timings to compute true Mean FPS, 1% Low (P99), Max spike, StdDev,
+    /// GC collections, allocations, Optio steal count, Option B strategy decisions, and hardware PMU telemetry.
     /// </summary>
-    private static void RunSuite(bool longStabilityMode, bool onlyHeavy = false)
+    private static void RunSuite(string mode)
     {
-        string modeLabel = onlyHeavy
-            ? "EXTREME CPU/MEMORY TORTURE STABILITY PROFILER (SCENARIOS 7-9)"
-            : (longStabilityMode ? "LONG CONTINUOUS FPS STABILITY PROFILER" : "QUICK VERIFICATION");
+        bool longStabilityMode = mode != "quick";
+        string modeLabel = mode switch
+        {
+            "heavy" => "EXTREME CPU/MEMORY TORTURE STABILITY PROFILER (SCENARIOS 7-11)",
+            "new"   => "OPTION A/B + ONLINELINUCB VALIDATION PROFILER (SCENARIOS 6, 10, 11)",
+            "quick" => "QUICK VERIFICATION (ALL 11 SCENARIOS)",
+            _       => "LONG CONTINUOUS FPS STABILITY PROFILER (ALL 11 SCENARIOS)"
+        };
+
         Console.WriteLine($"=== LEGIO {modeLabel} ===");
         Console.WriteLine($"CPU: {Environment.ProcessorCount} logical cores | Stopwatch: {Stopwatch.Frequency / 1_000_000.0:F1} MHz");
         Console.WriteLine();
 
-        int fastFrames   = longStabilityMode ? 1280 : 80;
-        int medFrames    = longStabilityMode ? 640  : 50;
-        int heavyFrames  = longStabilityMode ? 400  : 32;
-        int brutalFrames = longStabilityMode ? 240  : 20;
-        int serialFast   = longStabilityMode ? 64   : 12;
-        int serialHeavy  = longStabilityMode ? 24   : 6;
+        int fastFrames   = longStabilityMode ? 1280 : 60;
+        int medFrames    = longStabilityMode ? 640  : 40;
+        int heavyFrames  = longStabilityMode ? 400  : 24;
+        int brutalFrames = longStabilityMode ? 240  : 16;
+        int serialFast   = longStabilityMode ? 64   : 10;
+        int serialHeavy  = longStabilityMode ? 24   : 5;
         int serialBrutal = longStabilityMode ? 10   : 3;
 
-        if (!onlyHeavy)
+        if (mode == "quick" || mode == "stability")
         {
             RunScenario(
                 "1. ECS 3D Particle Physics (65,536 entities, 4 cohorts, 3 DAG phases, 24x cluster skew)",
-                fastFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
+                fastFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2, inspectSlot: 0,
                 () => { var s = new EcsParticleSimulation(65_536); return () => s.RunSerial(); },
                 () => { var s = new EcsParticleSimulation(65_536); return () => s.RunParallelFor(); },
                 leg => { var s = new EcsParticleSimulation(65_536); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
             RunScenario(
                 "2. 3D SDF Raymarching + Soft Shadows (320x180 = 57,600 rays, compute-bound skew)",
-                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 256, stride: 1,
+                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 256, stride: 1, inspectSlot: 0,
                 () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunSerial(); },
                 () => { var s = new RaymarchSdfSimulation(0, 320, 180); return () => s.RunParallelFor(); },
                 leg => { var s = new RaymarchSdfSimulation(0, 320, 180); s.Register(leg); return leg.ExecuteFrame; });
 
             RunScenario(
                 "3. AAA Game-Engine 12-Cohort Pipeline (32k entities + 128/256 micro-cohorts, 6 DAG phases, 10 resources)",
-                fastFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2,
+                fastFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2, inspectSlot: 0,
                 () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunSerial(); },
                 () => { var s = new GameEngineDagSimulation(32_768); return () => s.RunParallelFor(); },
                 leg => { var s = new GameEngineDagSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
             RunScenario(
                 "4. Boids Spatial Flocking (32,768 agents, 5 cohorts, 4 DAG phases, lock-free atomic grid contention)",
-                medFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2,
+                medFrames, serialFast, maxCohorts: 8, initialBatch: 512, stride: 2, inspectSlot: 2,
                 () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunSerial(); },
                 () => { var s = new BoidsSpatialFlockingSimulation(32_768); return () => s.RunParallelFor(); },
                 leg => { var s = new BoidsSpatialFlockingSimulation(32_768); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
             RunScenario(
                 "5. Multi-Agent A* Maze Pathfinding (2,048 agents, 64x64 maze, 2 DAG phases, ~100x heavy-tailed variance)",
-                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 32, stride: 1,
+                heavyFrames, serialHeavy, maxCohorts: 4, initialBatch: 32, stride: 1, inspectSlot: 0,
                 () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunSerial(); },
                 () => { var s = new AStarNavMeshCrowdSimulation(2_048); return () => s.RunParallelFor(); },
                 leg => { var s = new AStarNavMeshCrowdSimulation(2_048); s.RegisterAll(leg); return leg.ExecuteFrame; });
-
-            RunDynamicWaveScenario(longStabilityMode ? 1280 : 256, longStabilityMode ? 128 : 32);
         }
 
+        if (mode == "quick" || mode == "stability" || mode == "new")
+        {
+            RunDynamicWaveScenario(longStabilityMode ? 1280 : 192, longStabilityMode ? 128 : 24);
+        }
+
+        if (mode == "quick" || mode == "stability" || mode == "heavy")
+        {
+            RunScenario(
+                "7. Monte Carlo Path Tracing GI (240x135 x 6 SPP x 6 bounces, Fresnel glass + Russian Roulette + 2-phase Denoise)",
+                brutalFrames, serialBrutal, maxCohorts: 4, initialBatch: 128, stride: 1, inspectSlot: 0,
+                () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunSerial(); },
+                () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunParallelFor(); },
+                leg => { var s = new MonteCarloPathTracingSimulation(); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "8. Astrophysical O(N^2) N-Body Gravity + Collisions (3,072 bodies = 9.44M pairs/frame, 4 cohorts, 3 DAG phases)",
+                brutalFrames, serialBrutal, maxCohorts: 8, initialBatch: 64, stride: 1, inspectSlot: 0,
+                () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunSerial(); },
+                () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunParallelFor(); },
+                leg => { var s = new NBodyGravitySimulation(3_072); s.RegisterAll(leg); return leg.ExecuteFrame; });
+
+            RunScenario(
+                "9. Cloth PBD 256x256 Red-Black Solver (65,536 vertices, 260k constraints, 10 SEQUENTIAL DAG PHASES/frame!)",
+                medFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2, inspectSlot: 2,
+                () => { var s = new ClothVerletPbdSimulation(); return () => s.RunSerial(); },
+                () => { var s = new ClothVerletPbdSimulation(); return () => s.RunParallelFor(); },
+                leg => { var s = new ClothVerletPbdSimulation(); s.RegisterAll(leg); return () => { s.AdvanceWind(); leg.ExecuteFrame(); }; });
+        }
+
+        // Scenarios 10 & 11 run in ALL modes (quick, stability, heavy, new)
         RunScenario(
-            "7. Monte Carlo Path Tracing GI (240x135 x 6 SPP x 6 bounces, Fresnel glass + Russian Roulette + 2-phase Denoise)",
-            brutalFrames, serialBrutal, maxCohorts: 4, initialBatch: 128, stride: 1,
-            () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunSerial(); },
-            () => { var s = new MonteCarloPathTracingSimulation(); return () => s.RunParallelFor(); },
-            leg => { var s = new MonteCarloPathTracingSimulation(); s.RegisterAll(leg); return leg.ExecuteFrame; });
+            "10. 3D SPH Dam-Break Fluid (12,288 particles, 6 cohorts, 5 DAG phases, 27-cell L3 cache gather + density skew)",
+            brutalFrames, serialBrutal, maxCohorts: 8, initialBatch: 128, stride: 1, inspectSlot: 3,
+            () => { var s = new FluidSphSimulation(12_288); return () => s.RunSerial(); },
+            () => { var s = new FluidSphSimulation(12_288); return () => s.RunParallelFor(); },
+            leg => { var s = new FluidSphSimulation(12_288); s.RegisterAll(leg); return leg.ExecuteFrame; });
 
         RunScenario(
-            "8. Astrophysical O(N^2) N-Body Gravity + Collisions (3,072 bodies = 9.44M pairs/frame, 4 cohorts, 3 DAG phases)",
-            brutalFrames, serialBrutal, maxCohorts: 8, initialBatch: 64, stride: 1,
-            () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunSerial(); },
-            () => { var s = new NBodyGravitySimulation(3_072); return () => s.RunParallelFor(); },
-            leg => { var s = new NBodyGravitySimulation(3_072); s.RegisterAll(leg); return leg.ExecuteFrame; });
+            "11. Deep-Zoom Mandelbrot 2048-iter Fractal (384x216 = 82,944 px, ~500x asymmetric spatial skew + 2-phase DAG)",
+            brutalFrames, serialBrutal, maxCohorts: 4, initialBatch: 256, stride: 1, inspectSlot: 0,
+            () => { var s = new MandelbrotDeepZoomSimulation(); return () => s.RunSerial(); },
+            () => { var s = new MandelbrotDeepZoomSimulation(); return () => s.RunParallelFor(); },
+            leg => { var s = new MandelbrotDeepZoomSimulation(); s.RegisterAll(leg); return leg.ExecuteFrame; });
+    }
 
-        RunScenario(
-            "9. Cloth PBD 256x256 Red-Black Solver (65,536 vertices, 260k constraints, 10 SEQUENTIAL DAG PHASES/frame!)",
-            medFrames, serialFast, maxCohorts: 16, initialBatch: 512, stride: 2,
-            () => { var s = new ClothVerletPbdSimulation(); return () => s.RunSerial(); },
-            () => { var s = new ClothVerletPbdSimulation(); return () => s.RunParallelFor(); },
-            leg => { var s = new ClothVerletPbdSimulation(); s.RegisterAll(leg); return () => { s.AdvanceWind(); leg.ExecuteFrame(); }; });
+    private static string FormatStrategyAndPmu(Legatus legatus, int slot)
+    {
+        Strategia s = legatus.Scriba.Legere(slot);
+        SystemTelemetry t = legatus.CurrentSystemTelemetry;
+        char part = s.PartitionMode == PartitionMode.Interleaved ? 'I' : 'C';
+        char steal = s.StealMode == StealMode.StealHalf ? 'H' : '1';
+        string pmu = t.HasPmuCounters != 0
+            ? $" | IPC={t.InstructionsPerCycle:F2} L3M={t.CacheMissRate * 100:F1}%"
+            : "";
+        return $"B={s.BatchSize}/T={s.ThreadCount}/{part}/{steal}/A{s.AffinityHint}/Sp{s.SpinIterationsBeforePark}{pmu}";
     }
 
     private static void RunScenario(
@@ -122,6 +167,7 @@ public class Program
         int maxCohorts,
         int initialBatch,
         int stride,
+        int inspectSlot,
         Func<Action> createSerial,
         Func<Action> createParallel,
         Func<Legatus, Action> createLegio)
@@ -142,13 +188,14 @@ public class Program
                 MaxCohorts = maxCohorts,
                 OracleModel = model,
                 OracleIntervalMs = 80,
+                CpuMonitorIntervalMs = 150,
                 TelemetrySampleStride = stride,
                 InitialBatchSize = initialBatch
             });
 
             Action step = createLegio(legatus);
 
-            // Warmup & let Sanctum execute initial adaptation windows
+            // Warmup & let Sanctum execute initial adaptation windows + PMU check
             for (int w = 0; w < 20; w++) step();
             Thread.Sleep(110);
             for (int w = 0; w < 20; w++) step();
@@ -158,12 +205,7 @@ public class Program
             var stats = MeasurePerFrame(step, warmup: 5, frames: measureFrames);
             long steals = legatus.GetTotalSteals() - stealsBefore;
 
-            var s0 = legatus.Scriba.Legere(0);
-            string info = maxCohorts >= 16
-                ? $"B0={s0.BatchSize}/T2={legatus.Scriba.Legere(2).ThreadCount}/T9={legatus.Scriba.Legere(9).ThreadCount}"
-                : $"B0={s0.BatchSize}/T0={s0.ThreadCount}";
-
-            PrintRow($"Legio.{model}", stats, serialStats.MeanMs, steals, info);
+            PrintRow($"Legio.{model}", stats, serialStats.MeanMs, steals, FormatStrategyAndPmu(legatus, inspectSlot));
         }
 
         Console.WriteLine();
@@ -190,6 +232,7 @@ public class Program
                 MaxCohorts = 8,
                 OracleModel = model,
                 OracleIntervalMs = 60,
+                CpuMonitorIntervalMs = 150,
                 TelemetrySampleStride = 1,
                 InitialBatchSize = 512
             });
@@ -204,8 +247,7 @@ public class Program
             var stats = MeasurePerFrame(() => { sim.AdvanceFrameTick(); legatus.ExecuteFrame(); }, warmup: 0, frames: measureFrames);
             long steals = legatus.GetTotalSteals() - stealsBefore;
 
-            var s1 = legatus.Scriba.Legere(1);
-            PrintRow($"Legio.{model}", stats, serialStats.MeanMs, steals, $"B1={s1.BatchSize}/T1={s1.ThreadCount}");
+            PrintRow($"Legio.{model}", stats, serialStats.MeanMs, steals, FormatStrategyAndPmu(legatus, 1));
         }
 
         Console.WriteLine();
@@ -214,8 +256,8 @@ public class Program
     private static void PrintHeader()
     {
         Console.WriteLine(
-            $"{"Runner",-27} | {"Mean ms",8} | {"P95 ms",8} | {"P99 ms",8} | {"Max ms",8} | {"StdDev",7} | {"Speedup",7} | {"1%Low FPS",9} | {"Alloc/f",8} | {"GC0",3} | {"Steals",9} | {"Final Strategy"}");
-        Console.WriteLine(new string('-', 146));
+            $"{"Runner",-27} | {"Mean ms",8} | {"P95 ms",8} | {"P99 ms",8} | {"Max ms",8} | {"StdDev",7} | {"Speedup",7} | {"1%Low FPS",9} | {"Alloc/f",8} | {"GC0",3} | {"Steals",9} | {"Final Strategy (Part/Steal/Aff/Spin | PMU)"}");
+        Console.WriteLine(new string('-', 174));
     }
 
     private static void PrintRow(string name, FrameStats st, double serialMeanMs, long steals, string info)
