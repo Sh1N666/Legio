@@ -39,7 +39,10 @@ public sealed class Scriba
             BatchSize = batch,
             ThreadCount = threads,
             Confidence = 0.5f,
-            AffinityHint = 0
+            AffinityHint = 0,
+            SpinIterationsBeforePark = 1024,
+            PartitionMode = PartitionMode.Contiguous,
+            StealMode = StealMode.StealOne
         };
 
         _slots = new StrategySlot[maxCohorts];

@@ -17,16 +17,30 @@ public static class Mensor
     /// </summary>
     public static readonly Topologia Result;
 
+    private static readonly int[] _physicalFirstCpuMap;
+
     static Mensor()
     {
-        Result = SurveyHardware();
+        int logicalCores = Math.Max(1, Environment.ProcessorCount);
+        _physicalFirstCpuMap = BuildPhysicalFirstCpuMap(logicalCores, out int physicalCores);
+        Result = SurveyHardware(logicalCores, physicalCores);
     }
 
-    private static Topologia SurveyHardware()
+    /// <summary>
+    /// Maps a worker index [0..N-1] to a logical CPU ID such that indices [0..PhysicalCoreCount-1]
+    /// always occupy distinct physical cores before assigning SMT siblings. Zero allocation.
+    /// </summary>
+    public static int GetPreferredCpuId(int workerIndex)
     {
-        int logicalCores = Math.Max(1, Environment.ProcessorCount);
-        int physicalCores = DetectPhysicalCoreCount(logicalCores);
+        if (_physicalFirstCpuMap.Length == 0)
+            return 0;
 
+        int idx = workerIndex < 0 ? 0 : workerIndex % _physicalFirstCpuMap.Length;
+        return _physicalFirstCpuMap[idx];
+    }
+
+    private static Topologia SurveyHardware(int logicalCores, int physicalCores)
+    {
         CpuFeatures features = CpuFeatures.None;
         if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
         {
@@ -50,14 +64,17 @@ public static class Mensor
         };
     }
 
-    private static int DetectPhysicalCoreCount(int logicalCores)
+    private static int[] BuildPhysicalFirstCpuMap(int logicalCores, out int physicalCores)
     {
         if (OperatingSystem.IsLinux())
         {
             try
             {
-                // Count unique (physical_package_id, core_id) pairs in sysfs (startup-only, once per process).
-                var uniqueCores = new HashSet<(int pkg, int core)>();
+                // Partition logical CPUs into primary physical-core leaders first, then SMT siblings.
+                var seenCores = new HashSet<(int pkg, int core)>();
+                var primaryCpus = new List<int>(logicalCores);
+                var siblingCpus = new List<int>(logicalCores);
+
                 for (int cpu = 0; cpu < logicalCores; cpu++)
                 {
                     string corePath = $"/sys/devices/system/cpu/cpu{cpu}/topology/core_id";
@@ -68,11 +85,22 @@ public static class Mensor
                     int pkgId = File.Exists(pkgPath)
                         ? int.Parse(File.ReadAllText(pkgPath).AsSpan().Trim())
                         : 0;
-                    uniqueCores.Add((pkgId, coreId));
+
+                    if (seenCores.Add((pkgId, coreId)))
+                        primaryCpus.Add(cpu);
+                    else
+                        siblingCpus.Add(cpu);
                 }
 
-                if (uniqueCores.Count > 0)
-                    return uniqueCores.Count;
+                if (primaryCpus.Count > 0)
+                {
+                    physicalCores = primaryCpus.Count;
+                    var ordered = new int[primaryCpus.Count + siblingCpus.Count];
+                    int pos = 0;
+                    for (int i = 0; i < primaryCpus.Count; i++) ordered[pos++] = primaryCpus[i];
+                    for (int i = 0; i < siblingCpus.Count; i++) ordered[pos++] = siblingCpus[i];
+                    return ordered;
+                }
             }
             catch
             {
@@ -80,7 +108,11 @@ public static class Mensor
             }
         }
 
-        return logicalCores;
+        physicalCores = logicalCores;
+        var identity = new int[logicalCores];
+        for (int i = 0; i < logicalCores; i++)
+            identity[i] = i;
+        return identity;
     }
 
     private static long DetectL3CacheSize()

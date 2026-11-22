@@ -4,11 +4,12 @@ namespace Legio.Core.Augurium;
 
 /// <summary>
 /// Zero-allocation batch delegate invoked periodically on the dedicated Sanctum thread.
-/// Evaluates a time window of Tesserae and writes updated per-Cohort strategies into strategiesOut.
+/// Evaluates a time window of Tesserae alongside hardware PMU and system CPU telemetry,
+/// writing updated per-Cohort strategies into strategiesOut.
 /// </summary>
 public delegate void OraculumBatchFunc(
     in Topologia topo,
-    float cpuPressure,
+    in SystemTelemetry telemetry,
     ReadOnlySpan<Tessera> omens,
     Span<Strategia> strategiesOut,
     Span<byte> updatedMask);
@@ -38,6 +39,7 @@ public sealed class Sanctum : IDisposable
     private bool _disposed;
 
     public float CurrentCpuPressure => _speculator.ProcessCpuLoad;
+    public SystemTelemetry CurrentTelemetry => _speculator.CurrentTelemetry;
     public long RitualCount => Volatile.Read(ref _ritualCount);
 
     public Sanctum(
@@ -87,9 +89,9 @@ public sealed class Sanctum : IDisposable
 
             try
             {
-                // 1. Zero-allocation OS CPU pressure check.
+                // 1. Zero-allocation OS CPU pressure & hardware PMU reconnaissance check.
                 _speculator.Explorare();
-                float cpuPressure = _speculator.ProcessCpuLoad;
+                SystemTelemetry sysTelemetry = _speculator.CurrentTelemetry;
 
                 // 2. Drain accumulated telemetry window from Circulus.
                 ReadOnlySpan<Tessera> omens = _trecenarius.CollectOmens();
@@ -99,7 +101,7 @@ public sealed class Sanctum : IDisposable
                 Array.Clear(_updatedMask, 0, _updatedMask.Length);
 
                 // 3. Consult the Haruspex ML model on this dedicated background thread (0 B alloc).
-                _oracleLogic(in topology, cpuPressure, omens, _strategyScratch, _updatedMask);
+                _oracleLogic(in topology, in sysTelemetry, omens, _strategyScratch, _updatedMask);
 
                 // 4. Publish updated per-Cohort strategies atomically via Scriba SeqLock.
                 for (int slot = 0; slot < _updatedMask.Length; slot++)

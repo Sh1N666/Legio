@@ -9,11 +9,13 @@ namespace Legio.Core.Executio;
 /// <summary>
 /// Centurio (The Commander of 100).
 /// Worker executing local Optio chunks (LIFO) and stealing work from peer Centurions (FIFO)
-/// with Dekker-fenced parking and zero-allocation aggregated phase telemetry.
+/// with Dekker-fenced parking, adaptive PartitionMode (Contiguous/Interleaved),
+/// adaptive StealMode (StealOne/StealHalf), OS thread affinity pinning, adaptive spin budget,
+/// and zero-allocation aggregated phase telemetry (including BarrierWaitTicks and spatial half-ticks).
 /// </summary>
-public sealed class Centurio : IDisposable
+public sealed unsafe class Centurio : IDisposable
 {
-    private const int SpinIterationsBeforePark = 1024;
+    private const int DefaultSpinIterationsBeforePark = 1024;
 
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct PaddedLong
@@ -40,6 +42,8 @@ public sealed class Centurio : IDisposable
 
     // Pre-allocated per-phase telemetry scratch buffers (zero heap allocation in hot path).
     private readonly long[] _cohortTicks;
+    private readonly long[] _cohortFirstHalfTicks;
+    private readonly long[] _cohortSecondHalfTicks;
     private readonly int[] _cohortItems;
     private readonly int[] _touchedSlots;
     private int _touchedCount;
@@ -47,6 +51,8 @@ public sealed class Centurio : IDisposable
     private Centurio[] _legion = null!;
     private uint _rngState;
     private long _lastCompletedEpoch;
+    private int _appliedAffinityHint;
+    private volatile int _spinIterationsBeforePark;
 
     private PaddedLong _activeEpoch;
     private PaddedInt _isParked;
@@ -78,9 +84,13 @@ public sealed class Centurio : IDisposable
         Optio = new Optio(optioCapacity);
 
         _cohortTicks = new long[maxCohorts];
+        _cohortFirstHalfTicks = new long[maxCohorts];
+        _cohortSecondHalfTicks = new long[maxCohorts];
         _cohortItems = new int[maxCohorts];
         _touchedSlots = new int[maxCohorts];
         _rngState = (uint)(id * 747796405 + 2891336453) | 1u;
+        _appliedAffinityHint = (int)AffinityMode.None;
+        _spinIterationsBeforePark = DefaultSpinIterationsBeforePark;
         _activeEpoch.Value = -1;
         _isParked.Value = 0;
         _isRunning = true;
@@ -146,13 +156,31 @@ public sealed class Centurio : IDisposable
             return;
         }
 
+        // Option B.4: Update adaptive spin budget when changed.
+        int frameSpin = frame.SpinIterationsBeforePark;
+        if (frameSpin > 0 && frameSpin != _spinIterationsBeforePark)
+        {
+            _spinIterationsBeforePark = Math.Clamp(frameSpin, 64, 4096);
+        }
+
+        // Option B.3: Apply OS thread affinity pinning only on background workers and ONLY when hint changes.
+        if (_isBackgroundWorker && frame.AffinityHint != _appliedAffinityHint)
+        {
+            ApplyThreadAffinity(frame.AffinityHint);
+            _appliedAffinityHint = frame.AffinityHint;
+        }
+
         bool recordTelemetry = frame.RecordTelemetry;
+        StealMode stealMode = frame.StealMode;
+        int userSpinLimit = Math.Clamp(_spinIterationsBeforePark >> 4, 8, 128);
         int phaseSteals = 0;
         int phaseContentions = 0;
+        long phaseBarrierWaitTicks = 0;
+        long waitStartTicks = 0;
         _touchedCount = 0;
 
-        // 1. HYBRID INITIAL DISTRIBUTION:
-        // Claim our contiguous initial slice and push chunks into our own Optio (strict single-owner Push).
+        // 1. HYBRID INITIAL DISTRIBUTION (Option B.1: Contiguous or Interleaved):
+        // Claim our initial slice and push chunks into our own Optio (strict single-owner Push).
         if (Interlocked.CompareExchange(ref frame.InboxClaimed[Id].Value, 1, 0) == 0)
         {
             EnqueueWorkerSlice(frame, Id, recordTelemetry);
@@ -166,18 +194,28 @@ public sealed class Centurio : IDisposable
             // A. Primary: drain our local Optio (LIFO -> sequential forward memory traversal).
             if (Optio.TryPop(out TaskUnit localTask))
             {
-                ExecuteChunk(in localTask, recordTelemetry);
+                if (waitStartTicks != 0)
+                {
+                    phaseBarrierWaitTicks += Stopwatch.GetTimestamp() - waitStartTicks;
+                    waitStartTicks = 0;
+                }
+
+                ExecuteChunk(in localTask, frame, recordTelemetry);
                 emptyPolls = 0;
                 spin.Reset();
                 continue;
             }
 
-            // B. Secondary: steal from peer Centurions' Optio deques (FIFO -> opposite end of victim slice).
-            if (TryStealFromLegion(maxActive, out TaskUnit stolenTask, ref phaseContentions))
+            // B. Secondary: steal from peer Centurions' Optio deques (Option B.2: StealOne or StealHalf).
+            if (TryStealFromLegion(maxActive, stealMode, out TaskUnit stolenTask, ref phaseContentions, ref phaseSteals, frame, recordTelemetry))
             {
-                phaseSteals++;
-                _totalSteals++;
-                ExecuteChunk(in stolenTask, recordTelemetry);
+                if (waitStartTicks != 0)
+                {
+                    phaseBarrierWaitTicks += Stopwatch.GetTimestamp() - waitStartTicks;
+                    waitStartTicks = 0;
+                }
+
+                ExecuteChunk(in stolenTask, frame, recordTelemetry);
                 emptyPolls = 0;
                 spin.Reset();
                 continue;
@@ -186,6 +224,12 @@ public sealed class Centurio : IDisposable
             // C. Fallback: steal an unclaimed initial inbox from a peer delayed by OS wakeup jitter.
             if (TryStealUnclaimedInbox(frame, maxActive, recordTelemetry))
             {
+                if (waitStartTicks != 0)
+                {
+                    phaseBarrierWaitTicks += Stopwatch.GetTimestamp() - waitStartTicks;
+                    waitStartTicks = 0;
+                }
+
                 phaseSteals++;
                 _totalSteals++;
                 emptyPolls = 0;
@@ -193,11 +237,15 @@ public sealed class Centurio : IDisposable
                 continue;
             }
 
-            // D. All queues are empty, waiting for peer threads to complete in-flight chunks.
-            //    Spin briefly in pure user-space first so sub-50us multi-phase barriers avoid Linux sched_yield() storms.
+            // D. All queues are empty, waiting at phase barrier for straggler peers (Option A.1 telemetry).
             if (frame.RemainingTasks > 0)
             {
-                if (emptyPolls < 64)
+                if (recordTelemetry && waitStartTicks == 0)
+                {
+                    waitStartTicks = Stopwatch.GetTimestamp();
+                }
+
+                if (emptyPolls < userSpinLimit)
                 {
                     emptyPolls++;
                     Thread.SpinWait(16);
@@ -209,10 +257,15 @@ public sealed class Centurio : IDisposable
             }
         }
 
+        if (waitStartTicks != 0)
+        {
+            phaseBarrierWaitTicks += Stopwatch.GetTimestamp() - waitStartTicks;
+        }
+
         // 3. AGGREGATED TELEMETRY (at most 1 Tessera per touched cohort per sampled phase).
         if (recordTelemetry && _touchedCount > 0)
         {
-            EmitPhaseTelemetry(frame, phaseSteals, phaseContentions);
+            EmitPhaseTelemetry(frame, phaseSteals, phaseContentions, phaseBarrierWaitTicks);
         }
 
         if (phaseContentions > 0)
@@ -234,45 +287,80 @@ public sealed class Centurio : IDisposable
             if (targetWorkerId >= item.ActiveThreads)
                 continue;
 
-            int chunksPerWorker = item.TotalChunks / item.ActiveThreads;
-            int extra = item.TotalChunks % item.ActiveThreads;
-            int firstChunk = targetWorkerId * chunksPerWorker + Math.Min(targetWorkerId, extra);
-            int myChunks = chunksPerWorker + (targetWorkerId < extra ? 1 : 0);
-
-            if (myChunks <= 0)
-                continue;
-
             int batch = item.BatchSize;
             int total = item.TotalItems;
+            int totalChunks = item.TotalChunks;
+            int activeThreads = item.ActiveThreads;
             int cohortSlot = item.CohortSlot;
 
-            // Push in reverse order so owner's LIFO pops walk forward sequentially through memory,
-            // while thieves stealing FIFO start at the highest-index chunks (maximizing cache separation).
-            for (int c = firstChunk + myChunks - 1; c >= firstChunk; c--)
+            if (item.PartitionMode == PartitionMode.Interleaved)
             {
-                int start = c * batch;
-                int remaining = total - start;
-                int len = remaining < batch ? remaining : batch;
+                // Option B.1 (Interleaved/Strided): chunk c = targetWorkerId + k * activeThreads.
+                // Every chunk [0..totalChunks-1] maps bijectively to (c % activeThreads, c / activeThreads).
+                // Pushed in reverse k so owner's LIFO pops walk ascending memory indices.
+                if (targetWorkerId >= totalChunks)
+                    continue;
 
-                var unit = new TaskUnit
+                int lastK = (totalChunks - 1 - targetWorkerId) / activeThreads;
+                for (int k = lastK; k >= 0; k--)
                 {
-                    CohortSlot = cohortSlot,
-                    Start = start,
-                    Length = len,
-                    PhaseSlot = phaseSlot
-                };
+                    int c = targetWorkerId + k * activeThreads;
+                    int start = c * batch;
+                    int remaining = total - start;
+                    int len = remaining < batch ? remaining : batch;
 
-                if (!Optio.TryPush(in unit))
+                    var unit = new TaskUnit
+                    {
+                        CohortSlot = cohortSlot,
+                        Start = start,
+                        Length = len,
+                        PhaseSlot = phaseSlot
+                    };
+
+                    if (!Optio.TryPush(in unit))
+                    {
+                        ExecuteChunk(in unit, frame, recordTelemetry);
+                    }
+                }
+            }
+            else
+            {
+                // Option B.1 (Contiguous): contiguous slice per worker for spatial cache locality.
+                int chunksPerWorker = totalChunks / activeThreads;
+                int extra = totalChunks % activeThreads;
+                int firstChunk = targetWorkerId * chunksPerWorker + Math.Min(targetWorkerId, extra);
+                int myChunks = chunksPerWorker + (targetWorkerId < extra ? 1 : 0);
+
+                if (myChunks <= 0)
+                    continue;
+
+                // Push in reverse order so owner's LIFO pops walk forward sequentially through memory,
+                // while thieves stealing FIFO start at the highest-index chunks (maximizing cache separation).
+                for (int c = firstChunk + myChunks - 1; c >= firstChunk; c--)
                 {
-                    // Optio full: execute inline immediately so no chunk is ever lost.
-                    ExecuteChunk(in unit, recordTelemetry);
+                    int start = c * batch;
+                    int remaining = total - start;
+                    int len = remaining < batch ? remaining : batch;
+
+                    var unit = new TaskUnit
+                    {
+                        CohortSlot = cohortSlot,
+                        Start = start,
+                        Length = len,
+                        PhaseSlot = phaseSlot
+                    };
+
+                    if (!Optio.TryPush(in unit))
+                    {
+                        ExecuteChunk(in unit, frame, recordTelemetry);
+                    }
                 }
             }
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ExecuteChunk(in TaskUnit task, bool recordTelemetry)
+    private void ExecuteChunk(in TaskUnit task, PhaseFrame frame, bool recordTelemetry)
     {
         IPriorPilus commander = _legatus.GetCommander(task.CohortSlot);
 
@@ -281,7 +369,8 @@ public sealed class Centurio : IDisposable
             long startTicks = Stopwatch.GetTimestamp();
             commander.ExecuteBatch(task.Start, task.Length);
             long elapsed = Stopwatch.GetTimestamp() - startTicks;
-            AccumulateTelemetry(task.CohortSlot, elapsed, task.Length);
+            bool isFirstHalf = task.Start < frame.CohortHalfBoundary[task.CohortSlot];
+            AccumulateTelemetry(task.CohortSlot, elapsed, task.Length, isFirstHalf);
         }
         else
         {
@@ -293,7 +382,7 @@ public sealed class Centurio : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void AccumulateTelemetry(int cohortSlot, long elapsedTicks, int itemCount)
+    private void AccumulateTelemetry(int cohortSlot, long elapsedTicks, int itemCount, bool isFirstHalf)
     {
         if (_cohortItems[cohortSlot] == 0)
         {
@@ -302,21 +391,32 @@ public sealed class Centurio : IDisposable
 
         _cohortTicks[cohortSlot] += elapsedTicks;
         _cohortItems[cohortSlot] += itemCount;
+
+        if (isFirstHalf)
+            _cohortFirstHalfTicks[cohortSlot] += elapsedTicks;
+        else
+            _cohortSecondHalfTicks[cohortSlot] += elapsedTicks;
     }
 
-    private void EmitPhaseTelemetry(PhaseFrame frame, int phaseSteals, int phaseContentions)
+    private void EmitPhaseTelemetry(PhaseFrame frame, int phaseSteals, int phaseContentions, long phaseBarrierWaitTicks)
     {
         float cpuPressure = frame.CpuPressure;
         int frameItemCount = frame.ItemCount;
+        int activeWorkers = frame.MaxActiveThreads;
+        long waitPerCohort = _touchedCount > 1 ? phaseBarrierWaitTicks / _touchedCount : phaseBarrierWaitTicks;
 
         for (int i = 0; i < _touchedCount; i++)
         {
             int slot = _touchedSlots[i];
             int items = _cohortItems[slot];
             long ticks = _cohortTicks[slot];
+            long firstHalf = _cohortFirstHalfTicks[slot];
+            long secondHalf = _cohortSecondHalfTicks[slot];
 
             _cohortItems[slot] = 0;
             _cohortTicks[slot] = 0;
+            _cohortFirstHalfTicks[slot] = 0;
+            _cohortSecondHalfTicks[slot] = 0;
 
             if (items <= 0)
                 continue;
@@ -334,13 +434,17 @@ public sealed class Centurio : IDisposable
             var tessera = new Tessera
             {
                 DurationTicks = ticks,
+                BarrierWaitTicks = waitPerCohort,
+                FirstHalfTicks = firstHalf,
+                SecondHalfTicks = secondHalf,
                 ItemCount = items,
                 TotalCohortItems = totalCohortItems,
                 CenturioId = Id,
                 CohortId = slot,
                 StealCount = phaseSteals,
                 ContentionCount = phaseContentions,
-                CpuPressure = cpuPressure
+                CpuPressure = cpuPressure,
+                ActiveWorkers = activeWorkers
             };
 
             _trecenarius.Report(in tessera);
@@ -349,7 +453,14 @@ public sealed class Centurio : IDisposable
         _touchedCount = 0;
     }
 
-    private bool TryStealFromLegion(int maxActive, out TaskUnit stolenTask, ref int contentions)
+    private bool TryStealFromLegion(
+        int maxActive,
+        StealMode stealMode,
+        out TaskUnit stolenTask,
+        ref int contentions,
+        ref int phaseSteals,
+        PhaseFrame frame,
+        bool recordTelemetry)
     {
         if (maxActive <= 1 || _legion == null)
         {
@@ -371,7 +482,40 @@ public sealed class Centurio : IDisposable
             {
                 StealResult result = victimOptio.TrySteal(out stolenTask);
                 if (result == StealResult.Success)
+                {
+                    phaseSteals++;
+                    _totalSteals++;
+
+                    // Option B.2 (StealHalf): amortize CAS overhead by pulling up to half of victim's remaining
+                    // backlog (capped at 7 extra chunks) into our empty local Optio deque.
+                    if (stealMode == StealMode.StealHalf)
+                    {
+                        int victimRemaining = victimOptio.ApproximateCount;
+                        int extraTarget = Math.Min(7, victimRemaining >> 1);
+                        for (int e = 0; e < extraTarget; e++)
+                        {
+                            StealResult extraRes = victimOptio.TrySteal(out TaskUnit extraUnit);
+                            if (extraRes == StealResult.Success)
+                            {
+                                phaseSteals++;
+                                _totalSteals++;
+                                if (!Optio.TryPush(in extraUnit))
+                                {
+                                    ExecuteChunk(in extraUnit, frame, recordTelemetry);
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                if (extraRes == StealResult.Contended)
+                                    contentions++;
+                                break;
+                            }
+                        }
+                    }
+
                     return true;
+                }
 
                 if (result == StealResult.Empty)
                     break;
@@ -407,6 +551,66 @@ public sealed class Centurio : IDisposable
         return false;
     }
 
+    private void ApplyThreadAffinity(int affinityHint)
+    {
+        try
+        {
+            int logicalCores = Math.Max(1, Mensor.Result.LogicalCoreCount);
+
+            if (OperatingSystem.IsLinux())
+            {
+                byte* mask = stackalloc byte[128];
+                new Span<byte>(mask, 128).Clear();
+
+                if (affinityHint == (int)AffinityMode.PhysicalCoresFirst)
+                {
+                    int cpu = Mensor.GetPreferredCpuId(Id);
+                    if ((uint)cpu < 1024u)
+                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
+                }
+                else if (affinityHint == (int)AffinityMode.PinnedAllLogical)
+                {
+                    int cpu = Id % logicalCores;
+                    if ((uint)cpu < 1024u)
+                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
+                }
+                else
+                {
+                    int count = Math.Min(logicalCores, 1024);
+                    for (int cpu = 0; cpu < count; cpu++)
+                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
+                }
+
+                LinuxSchedSetAffinity(0, 128, mask);
+            }
+            else if (OperatingSystem.IsWindows())
+            {
+                int limit = Math.Min(logicalCores, 64);
+                ulong maskBits;
+                if (affinityHint == (int)AffinityMode.PhysicalCoresFirst)
+                {
+                    int cpu = Mensor.GetPreferredCpuId(Id) % limit;
+                    maskBits = 1UL << cpu;
+                }
+                else if (affinityHint == (int)AffinityMode.PinnedAllLogical)
+                {
+                    int cpu = Id % limit;
+                    maskBits = 1UL << cpu;
+                }
+                else
+                {
+                    maskBits = limit == 64 ? ulong.MaxValue : ((1UL << limit) - 1UL);
+                }
+
+                SetThreadAffinityMask(GetCurrentThread(), (nuint)maskBits);
+            }
+        }
+        catch
+        {
+            // Ignore affinity failures in restricted containers / cgroups
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int NextVictim(int bound)
     {
@@ -430,8 +634,9 @@ public sealed class Centurio : IDisposable
                 continue;
             }
 
-            // Short adaptive spin so back-to-back phases / frames avoid OS futex latency.
-            for (int spin = 0; spin < SpinIterationsBeforePark; spin++)
+            // Adaptive spin budget controlled by Haruspex Strategia.SpinIterationsBeforePark (Option B.4).
+            int spinBudget = _spinIterationsBeforePark;
+            for (int spin = 0; spin < spinBudget; spin++)
             {
                 if (!_isRunning || _legatus.CurrentEpoch > _lastCompletedEpoch)
                     break;
@@ -476,4 +681,13 @@ public sealed class Centurio : IDisposable
             _wakeEvent?.Dispose();
         }
     }
+
+    [DllImport("libc", EntryPoint = "sched_setaffinity", ExactSpelling = true)]
+    private static extern int LinuxSchedSetAffinity(int pid, nuint cpusetsize, void* mask);
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    private static extern IntPtr GetCurrentThread();
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    private static extern nuint SetThreadAffinityMask(IntPtr hThread, nuint dwThreadAffinityMask);
 }

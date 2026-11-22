@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Legio.Protocol;
 
 namespace Legio.Core.Executio;
 
@@ -15,10 +16,12 @@ internal struct CohortWorkItem
     public int BatchSize;
     public int TotalChunks;
     public int ActiveThreads;
+    public PartitionMode PartitionMode;
+    public StealMode StealMode;
 }
 
 /// <summary>
-/// Pre-allocated phase frame stored in an 8-slot epoch ring inside Legatus.
+/// Pre-allocated phase frame stored in the epoch ring inside Legatus.
 /// Owns its own cache-line-padded RemainingTasks counter so consecutive phases never interfere.
 /// </summary>
 internal sealed class PhaseFrame
@@ -39,6 +42,7 @@ internal sealed class PhaseFrame
 
     public readonly CohortWorkItem[] Items;
     public readonly PaddedInt[] InboxClaimed;
+    public readonly int[] CohortHalfBoundary;
     public readonly int Slot;
 
     private PaddedLong _remainingTasks;
@@ -47,12 +51,17 @@ internal sealed class PhaseFrame
     public int MaxActiveThreads;
     public bool RecordTelemetry;
     public float CpuPressure;
+    public StealMode StealMode;
+    public int AffinityHint;
+    public int SpinIterationsBeforePark;
 
     public PhaseFrame(int slot, int maxCohorts, int maxThreads)
     {
         Slot = slot;
         Items = new CohortWorkItem[maxCohorts];
         InboxClaimed = new PaddedInt[maxThreads];
+        CohortHalfBoundary = new int[maxCohorts];
+        SpinIterationsBeforePark = 1024;
     }
 
     public long RemainingTasks

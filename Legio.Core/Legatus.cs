@@ -63,6 +63,7 @@ public sealed class Legatus : IDisposable
     public bool IsHaruspexLoaded { get; }
     public OraculumModel ActiveOracleModel => _config.OracleModel;
     public long OracleRitualCount => _sanctum.RitualCount;
+    public SystemTelemetry CurrentSystemTelemetry => _sanctum.CurrentTelemetry;
 
     internal long CurrentEpoch
     {
@@ -260,6 +261,9 @@ public sealed class Legatus : IDisposable
             int activeItemCount = 0;
             int maxActiveThreads = 1;
             long totalPhaseChunks = 0;
+            StealMode phaseStealMode = StealMode.StealOne;
+            int phaseAffinityHint = 0;
+            int phaseSpinBudget = 64;
 
             for (int i = 0; i < gradus.Count; i++)
             {
@@ -276,6 +280,7 @@ public sealed class Legatus : IDisposable
                 int batchSize = Math.Clamp(strat.BatchSize, 1, totalItems);
                 int totalChunks = (int)(((long)totalItems + batchSize - 1) / batchSize);
 
+                frame.CohortHalfBoundary[cohors.Slot] = totalItems >> 1;
                 frame.Items[activeItemCount++] = new CohortWorkItem
                 {
                     CohortSlot = cohors.Slot,
@@ -283,12 +288,24 @@ public sealed class Legatus : IDisposable
                     TotalItems = totalItems,
                     BatchSize = batchSize,
                     TotalChunks = totalChunks,
-                    ActiveThreads = activeThreads
+                    ActiveThreads = activeThreads,
+                    PartitionMode = strat.PartitionMode,
+                    StealMode = strat.StealMode
                 };
 
                 totalPhaseChunks += totalChunks;
                 if (activeThreads > maxActiveThreads)
                     maxActiveThreads = activeThreads;
+                if (strat.StealMode == StealMode.StealHalf)
+                    phaseStealMode = StealMode.StealHalf;
+                if (strat.AffinityHint > phaseAffinityHint)
+                    phaseAffinityHint = strat.AffinityHint;
+
+                int spin = strat.SpinIterationsBeforePark > 0
+                    ? Math.Clamp(strat.SpinIterationsBeforePark, 64, 4096)
+                    : 1024;
+                if (spin > phaseSpinBudget)
+                    phaseSpinBudget = spin;
             }
 
             if (totalPhaseChunks == 0)
@@ -298,6 +315,9 @@ public sealed class Legatus : IDisposable
             frame.MaxActiveThreads = maxActiveThreads;
             frame.RecordTelemetry = recordTelemetry;
             frame.CpuPressure = _sanctum.CurrentCpuPressure;
+            frame.StealMode = phaseStealMode;
+            frame.AffinityHint = phaseAffinityHint;
+            frame.SpinIterationsBeforePark = phaseSpinBudget;
 
             for (int w = 0; w < maxActiveThreads; w++)
             {
@@ -425,7 +445,7 @@ public sealed class Legatus : IDisposable
 
     private void FallbackOraculum(
         in Topologia topo,
-        float cpuPressure,
+        in SystemTelemetry telemetry,
         ReadOnlySpan<Tessera> omens,
         Span<Strategia> strategiesOut,
         Span<byte> updatedMask)
@@ -436,7 +456,10 @@ public sealed class Legatus : IDisposable
             BatchSize = Math.Max(16, _config.InitialBatchSize),
             ThreadCount = threads,
             Confidence = 0.5f,
-            AffinityHint = cpuPressure > 0.85f ? 1 : 0
+            AffinityHint = telemetry.ExternalCpuLoad > 0.5f ? (int)AffinityMode.PhysicalCoresFirst : (int)AffinityMode.None,
+            SpinIterationsBeforePark = telemetry.ExternalCpuLoad > 0.5f ? 256 : 1024,
+            PartitionMode = PartitionMode.Contiguous,
+            StealMode = StealMode.StealOne
         };
 
         int limit = Math.Min(strategiesOut.Length, updatedMask.Length);
