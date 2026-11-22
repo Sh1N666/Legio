@@ -1,6 +1,7 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 using Legio.Protocol;
 
 namespace Legio.Core.Augurium;
@@ -12,7 +13,7 @@ namespace Legio.Core.Augurium;
 public static class Mensor
 {
     /// <summary>
-    /// The cached result of the survey.
+    /// The cached result of the hardware survey.
     /// </summary>
     public static readonly Topologia Result;
 
@@ -21,50 +22,97 @@ public static class Mensor
         Result = SurveyHardware();
     }
 
-    /// <summary>
-    /// Performs the hardware survey.
-    /// </summary>
     private static Topologia SurveyHardware()
     {
-        var topo = new Topologia();
-        
-        topo.LogicalCoreCount = Environment.ProcessorCount;
-        
-        // Default assumption: All cores are "Performance" unless detected otherwise.
-        // Deep P/E core detection requires OS-specific API calls (GetLogicalProcessorInformationEx on Windows).
-        // For the MVP, we assume uniform topology or manual configuration.
-        topo.PerformanceCoreCount = topo.LogicalCoreCount; 
+        int logicalCores = Math.Max(1, Environment.ProcessorCount);
+        int physicalCores = DetectPhysicalCoreCount(logicalCores);
 
-        // Detect Cache Line Size (Heuristic default is 64 bytes for x64/ARM64).
-        topo.CacheLineSize = 64; 
-
-        // Detect SIMD capabilities
+        CpuFeatures features = CpuFeatures.None;
         if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
         {
-            topo.HasAvx512 = false;
-            topo.HasAvx2 = AdvSimd.IsSupported; // Mapping NEON to AVX2 level for logic simplicity
+            if (AdvSimd.IsSupported) features |= CpuFeatures.Neon;
         }
         else
         {
-            topo.HasAvx512 = Avx512F.IsSupported;
-            topo.HasAvx2 = Avx2.IsSupported;
+            if (Avx512F.IsSupported) features |= CpuFeatures.Avx512F;
+            if (Avx2.IsSupported) features |= CpuFeatures.Avx2;
         }
 
-        // L3 Cache estimation (Placeholder).
-        // Real implementation requires CPUID leaf 0x4 (Intel) or 0x8000001D (AMD).
-        topo.L3CacheSize = 0; 
+        return new Topologia
+        {
+            StopwatchFrequency = Stopwatch.Frequency,
+            L3CacheSize = DetectL3CacheSize(),
+            LogicalCoreCount = logicalCores,
+            PhysicalCoreCount = physicalCores,
+            PerformanceCoreCount = physicalCores,
+            CacheLineSize = 64,
+            Features = features
+        };
+    }
 
-        return topo;
+    private static int DetectPhysicalCoreCount(int logicalCores)
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                // Count unique (physical_package_id, core_id) pairs in sysfs (startup-only, once per process).
+                var uniqueCores = new HashSet<(int pkg, int core)>();
+                for (int cpu = 0; cpu < logicalCores; cpu++)
+                {
+                    string corePath = $"/sys/devices/system/cpu/cpu{cpu}/topology/core_id";
+                    string pkgPath = $"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id";
+                    if (!File.Exists(corePath)) continue;
+
+                    int coreId = int.Parse(File.ReadAllText(corePath).AsSpan().Trim());
+                    int pkgId = File.Exists(pkgPath)
+                        ? int.Parse(File.ReadAllText(pkgPath).AsSpan().Trim())
+                        : 0;
+                    uniqueCores.Add((pkgId, coreId));
+                }
+
+                if (uniqueCores.Count > 0)
+                    return uniqueCores.Count;
+            }
+            catch
+            {
+                // Fall back safely on containerized / restricted environments.
+            }
+        }
+
+        return logicalCores;
+    }
+
+    private static long DetectL3CacheSize()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                string path = "/sys/devices/system/cpu/cpu0/cache/index3/size";
+                if (File.Exists(path))
+                {
+                    string raw = File.ReadAllText(path).Trim();
+                    if (raw.EndsWith('K') && long.TryParse(raw.AsSpan(0, raw.Length - 1), out long kb))
+                        return kb * 1024;
+                    if (raw.EndsWith('M') && long.TryParse(raw.AsSpan(0, raw.Length - 1), out long mb))
+                        return mb * 1024 * 1024;
+                }
+            }
+            catch
+            {
+                // Ignore if sysfs cache info is unavailable.
+            }
+        }
+
+        return 0;
     }
 
     /// <summary>
-    /// Checks if the current thread is running on a Performance Core.
-    /// (This is a simplified heuristic; real implementation needs OS thread ID checks).
+    /// Checks if the given thread index maps to a performance core heuristic.
     /// </summary>
     public static bool IsPerformanceCore(int threadIndex)
     {
-        // In hybrid architectures (Intel 12th+ gen), P-Cores usually have lower indices
-        // if thread affinity is not manually scrambled.
-        return threadIndex < Result.PerformanceCoreCount;
+        return threadIndex >= 0 && threadIndex < Result.PerformanceCoreCount;
     }
 }

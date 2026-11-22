@@ -1,81 +1,120 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace Legio.Core.Armarium;
 
 /// <summary>
-/// Vexillum (The Standard/Flag). 
-/// Represents a bitmask of occupied memory territory (components).
-/// It uses 256 bits (4 x ulong), allowing it to handle up to 256 distinct component types.
-/// Zero allocation: this is a pure value type stored on the stack.
+/// Vexillum (The Standard/Flag).
+/// Represents a 256-bit mask of memory territory (component/resource IDs 0..255).
+/// Zero-allocation value type accelerated via Vector256 SIMD when available.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
-public unsafe struct Vexillum
+public struct Vexillum
 {
-    // Fixed buffer - key to zero-allocation. 
-    // Embedded directly within the struct, not an array on the heap.
-    private fixed ulong _signa[4]; 
+    private ulong _s0;
+    private ulong _s1;
+    private ulong _s2;
+    private ulong _s3;
+
+    public readonly bool IsEmpty => (_s0 | _s1 | _s2 | _s3) == 0;
 
     /// <summary>
-    /// Raises the standard for a specific bit (marks the component as used/active).
+    /// Raises the standard for a specific resource bit (0..255).
     /// </summary>
-    /// <param name="index">The bit index (0-255).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Tollere(int index)
     {
-        // Guard check without throwing exceptions for maximum performance
-        if ((uint)index >= 256) return; 
-        _signa[index / 64] |= (1UL << (index % 64));
-    }
-
-    /// <summary>
-    /// Checks if two standards conflict (Collision/Contention).
-    /// Returns TRUE if both Vexilla claim the same bit.
-    /// </summary>
-    /// <param name="alia">The other Vexillum to check against.</param>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool Confligerea(in Vexillum alia)
-    {
-        // Manual Loop Unrolling for maximum SIMD efficiency.
-        // Checks 64 bits at a time.
-        fixed (ulong* ptr = _signa)
-        fixed (ulong* aliaPtr = alia._signa)
+        if ((uint)index >= 256) return;
+        ulong bit = 1UL << (index & 63);
+        switch (index >> 6)
         {
-            if ((ptr[0] & aliaPtr[0]) != 0) return true;
-            if ((ptr[1] & aliaPtr[1]) != 0) return true;
-            if ((ptr[2] & aliaPtr[2]) != 0) return true;
-            if ((ptr[3] & aliaPtr[3]) != 0) return true;
+            case 0: _s0 |= bit; break;
+            case 1: _s1 |= bit; break;
+            case 2: _s2 |= bit; break;
+            case 3: _s3 |= bit; break;
         }
-        return false;
     }
 
     /// <summary>
-    /// Joins two standards together (Bitwise OR / Logical Sum).
-    /// Used by the Legatus to build the cumulative mask for a battle phase.
+    /// Lowers the standard for a specific resource bit (0..255).
     /// </summary>
-    /// <param name="alia">The other Vexillum to merge.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Deponere(int index)
+    {
+        if ((uint)index >= 256) return;
+        ulong mask = ~(1UL << (index & 63));
+        switch (index >> 6)
+        {
+            case 0: _s0 &= mask; break;
+            case 1: _s1 &= mask; break;
+            case 2: _s2 &= mask; break;
+            case 3: _s3 &= mask; break;
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the specified resource bit is raised.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool Habet(int index)
+    {
+        if ((uint)index >= 256) return false;
+        ulong bit = 1UL << (index & 63);
+        return (index >> 6) switch
+        {
+            0 => (_s0 & bit) != 0,
+            1 => (_s1 & bit) != 0,
+            2 => (_s2 & bit) != 0,
+            _ => (_s3 & bit) != 0
+        };
+    }
+
+    /// <summary>
+    /// Checks if two standards conflict (share at least one resource bit).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool Confligere(in Vexillum alia)
+    {
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var a = Unsafe.As<ulong, Vector256<ulong>>(ref Unsafe.AsRef(in _s0));
+            var b = Unsafe.As<ulong, Vector256<ulong>>(ref Unsafe.AsRef(in alia._s0));
+            return (a & b) != Vector256<ulong>.Zero;
+        }
+
+        return ((_s0 & alia._s0) | (_s1 & alia._s1) | (_s2 & alia._s2) | (_s3 & alia._s3)) != 0;
+    }
+
+    /// <summary>
+    /// Merges another standard into this one (bitwise OR).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Iungere(in Vexillum alia)
     {
-        fixed (ulong* ptr = _signa)
-        fixed (ulong* aliaPtr = alia._signa)
+        if (Vector256.IsHardwareAccelerated)
         {
-            ptr[0] |= aliaPtr[0];
-            ptr[1] |= aliaPtr[1];
-            ptr[2] |= aliaPtr[2];
-            ptr[3] |= aliaPtr[3];
+            ref var a = ref Unsafe.As<ulong, Vector256<ulong>>(ref _s0);
+            var b = Unsafe.As<ulong, Vector256<ulong>>(ref Unsafe.AsRef(in alia._s0));
+            a |= b;
+            return;
         }
+
+        _s0 |= alia._s0;
+        _s1 |= alia._s1;
+        _s2 |= alia._s2;
+        _s3 |= alia._s3;
     }
 
     /// <summary>
-    /// Cleans the standard (Resets all bits to zero).
+    /// Resets all 256 bits to zero.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Purgare()
     {
-        fixed (ulong* ptr = _signa)
-        {
-            ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0;
-        }
+        _s0 = 0;
+        _s1 = 0;
+        _s2 = 0;
+        _s3 = 0;
     }
 }

@@ -1,61 +1,46 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using Legio.Core.Augurium;
 using Legio.Protocol;
 
 namespace Legio.Core.Armarium;
 
 /// <summary>
 /// Circulus (The Ring).
-/// A lock-free, zero-allocation Multi-Producer Single-Consumer (MPSC) ring buffer.
-/// Used to stream Tesserae (metrics) from worker threads to the Trecenarius without blocking execution.
+/// A lock-free, zero-allocation Multi-Producer Single-Consumer (MPSC) bounded ring buffer
+/// based on Dmitry Vyukov's sequence-slot algorithm.
 /// </summary>
-public unsafe class Circulus
+public sealed class Circulus
 {
-    // The raw buffer of Tesserae.
     private readonly Tessera[] _buffer;
-    
-    // Sequence numbers for each slot to handle the "ABA problem" and detect slot availability.
-    // This ensures a writer doesn't overwrite a slot that hasn't been read yet.
-    private readonly int[] _sequences;
-
-    private readonly int _mask;
+    private readonly long[] _sequences;
+    private readonly long _mask;
     private readonly int _capacity;
 
-    // Cache-line padding to prevent False Sharing between Head and Tail.
-    // Standard cache line is 64 bytes.
     [StructLayout(LayoutKind.Explicit, Size = 64)]
-    private struct Padding { }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CacheLine
+    private struct PaddedLong
     {
-        public volatile int Value;
-        // Padding to ensure 'Value' takes up a full cache line alone
-        private long _p1, _p2, _p3, _p4, _p5, _p6, _p7; 
+        [FieldOffset(0)]
+        public long Value;
     }
 
-    private CacheLine _head; // Write Index (shared by producers)
-#pragma warning disable CS0169 // Field is never used
-    private Padding _pad1;   // Spacer to prevent False Sharing
-#pragma warning restore CS0169
-    private CacheLine _tail; // Read Index (owned by consumer)
+    private PaddedLong _head; // Shared by producers (isolated on its own 64-byte cache line)
+    private PaddedLong _tail; // Owned by single consumer (isolated on its own 64-byte cache line)
+
+    public int Capacity => _capacity;
 
     public Circulus(int capacity = 4096)
     {
-        // Capacity must be a power of 2 for fast bitwise masking
-        if ((capacity & (capacity - 1)) != 0)
-            throw new ArgumentException("Capacity must be a power of 2");
+        if (capacity < 2 || (capacity & (capacity - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity), "Capacity must be a power of 2 and at least 2.");
 
         _capacity = capacity;
         _mask = capacity - 1;
         _buffer = new Tessera[capacity];
-        _sequences = new int[capacity];
+        _sequences = new long[capacity];
 
-        // Initialize sequence numbers
         for (int i = 0; i < capacity; i++)
         {
-            _sequences[i] = i; // Initial sequence matches the index
+            _sequences[i] = i;
         }
 
         _head.Value = 0;
@@ -63,68 +48,69 @@ public unsafe class Circulus
     }
 
     /// <summary>
-    /// Attempts to write a report into the ring.
-    /// Returns false if the buffer is full (metrics are dropped to preserve performance).
-    /// Safe for concurrent calls from multiple threads.
+    /// Attempts to write a telemetry tablet into the ring buffer.
+    /// Returns false only when the ring is genuinely full (never on transient producer contention).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryWrite(in Tessera item)
     {
-        int head, nextHead;
-        
-        // Optimistic concurrency loop
-        do
+        long head = Volatile.Read(ref _head.Value);
+
+        while (true)
         {
-            head = _head.Value;
-            nextHead = (head + 1); // We don't mask here, numbers grow indefinitely
-            
-            // Check if the slot matches the expected sequence for writing
-            if (_sequences[head & _mask] != head)
+            int slot = (int)(head & _mask);
+            long seq = Volatile.Read(ref _sequences[slot]);
+            long diff = seq - head;
+
+            if (diff == 0)
             {
-                // Buffer is full or slot is busy (consumer hasn't caught up)
-                // In a high-perf simulation, we prefer dropping a metric over blocking a thread.
-                return false; 
+                long prev = Interlocked.CompareExchange(ref _head.Value, head + 1, head);
+                if (prev == head)
+                {
+                    _buffer[slot] = item;
+                    // Release fence: guarantees item payload is visible before sequence signals readiness.
+                    Volatile.Write(ref _sequences[slot], head + 1);
+                    return true;
+                }
+
+                head = prev;
+            }
+            else if (diff < 0)
+            {
+                // Buffer is full; drop metric rather than blocking a worker thread.
+                return false;
+            }
+            else
+            {
+                // Another producer already claimed and committed this slot; reload head and retry.
+                head = Volatile.Read(ref _head.Value);
             }
         }
-        // Try to reserve the slot
-        while (Interlocked.CompareExchange(ref _head.Value, nextHead, head) != head);
-
-        // We won the race for 'head'. Write the data.
-        _buffer[head & _mask] = item;
-
-        // Commit the write by updating the sequence number to allow reading.
-        // We set it to (head + 1) which is what the consumer expects.
-        Volatile.Write(ref _sequences[head & _mask], head + 1);
-        
-        return true;
     }
 
     /// <summary>
-    /// Attempts to read a report from the ring.
-    /// Only called by the Trecenarius (Single Consumer).
+    /// Attempts to read a telemetry tablet from the ring buffer.
+    /// Single-Consumer only (called exclusively by Trecenarius on the Sanctum thread).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryRead(out Tessera item)
     {
-        int tail = _tail.Value;
-        
-        // Check if the sequence number at the tail matches the expected value (tail + 1)
-        // This means the writer has finished writing and incremented the sequence.
-        if (_sequences[tail & _mask] != (tail + 1))
+        long tail = _tail.Value;
+        int slot = (int)(tail & _mask);
+
+        // Acquire fence: pairs with producer's Volatile.Write so payload read cannot be reordered above this check.
+        long seq = Volatile.Read(ref _sequences[slot]);
+        if (seq != tail + 1)
         {
             item = default;
-            return false; // Buffer empty or write in progress
+            return false;
         }
 
-        // Read the data
-        item = _buffer[tail & _mask];
-
-        // Advance the tail locally (since we are single consumer)
+        item = _buffer[slot];
         _tail.Value = tail + 1;
 
-        // Reset sequence number to allow writing to this slot in the next cycle (tail + capacity)
-        Volatile.Write(ref _sequences[tail & _mask], tail + _capacity);
-
+        // Release fence: allows producers to reuse this slot in the next wrap-around cycle.
+        Volatile.Write(ref _sequences[slot], tail + _capacity);
         return true;
     }
 }

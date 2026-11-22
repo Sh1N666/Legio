@@ -131,13 +131,13 @@ public class Legatus : IDisposable
 
                 var candidate = _tabularium[i];
 
-                // CONFLICT CHECKS (Confligerea)
+                // CONFLICT CHECKS (Confligere)
                 // 1. Write-Write Conflict
-                bool writeConflict = gradusWrites.Confligerea(candidate.WriteMask);
+                bool writeConflict = gradusWrites.Confligere(candidate.WriteMask);
                 // 2. Read-Write Conflict
-                bool readWriteConflict = gradusReads.Confligerea(candidate.WriteMask);
+                bool readWriteConflict = gradusReads.Confligere(candidate.WriteMask);
                 // 3. Write-Read Conflict
-                bool writeReadConflict = gradusWrites.Confligerea(candidate.ReadMask);
+                bool writeReadConflict = gradusWrites.Confligere(candidate.ReadMask);
 
                 if (!writeConflict && !readWriteConflict && !writeReadConflict)
                 {
