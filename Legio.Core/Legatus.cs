@@ -362,7 +362,7 @@ public sealed class Legatus : IDisposable
         {
             while (_centurions[i].ActiveEpoch == staleEpoch)
             {
-                spin.SpinOnce();
+                spin.SpinOnce(sleep1Threshold: -1);
             }
         }
     }

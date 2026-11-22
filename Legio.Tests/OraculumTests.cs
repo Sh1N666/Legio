@@ -188,7 +188,7 @@ public class OraculumTests
                 CohortId = 0,
                 CenturioId = 0,
                 ItemCount = 20_000,
-                TotalCohortItems = 200_000,
+                TotalCohortItems = 500_000,
                 DurationTicks = simulatedDurationTicks
             };
             omens[1] = new Tessera
@@ -196,7 +196,7 @@ public class OraculumTests
                 CohortId = 0,
                 CenturioId = 1,
                 ItemCount = 20_000,
-                TotalCohortItems = 200_000,
+                TotalCohortItems = 500_000,
                 DurationTicks = simulatedDurationTicks + 5_000
             };
 

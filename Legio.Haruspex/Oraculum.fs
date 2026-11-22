@@ -142,7 +142,7 @@ module private FuzzyMath =
 
     let computeBatchBounds (frameItems: int) (activeThreads: int) : struct (int * int) =
         let minBatch = min 16 (max 1 frameItems)
-        let desiredMaxForStealing = max minBatch (frameItems / max 1 (activeThreads * 2))
+        let desiredMaxForStealing = max minBatch (frameItems / max 1 (activeThreads * 4))
         let maxBatch = max minBatch (min frameItems desiredMaxForStealing)
         struct (minBatch, maxBatch)
 

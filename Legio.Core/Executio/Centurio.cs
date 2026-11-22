@@ -13,7 +13,7 @@ namespace Legio.Core.Executio;
 /// </summary>
 public sealed class Centurio : IDisposable
 {
-    private const int SpinIterationsBeforePark = 256;
+    private const int SpinIterationsBeforePark = 1024;
 
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct PaddedLong
@@ -190,9 +190,10 @@ public sealed class Centurio : IDisposable
             }
 
             // D. All queues are empty, waiting for peer threads to complete in-flight chunks.
+            //    sleep1Threshold: -1 prevents SpinWait from triggering a 1ms OS sleep mid-phase.
             if (frame.RemainingTasks > 0)
             {
-                spin.SpinOnce();
+                spin.SpinOnce(sleep1Threshold: -1);
             }
         }
 
