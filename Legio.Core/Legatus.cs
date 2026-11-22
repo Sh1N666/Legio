@@ -1,280 +1,476 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Legio.Core.Augurium;
 using Legio.Core.Executio;
-using Legio.Core.Armarium;
 using Legio.Protocol;
 
 namespace Legio.Core;
 
 /// <summary>
 /// Legatus (The General).
-/// The supreme commander of the ECS architecture.
-/// Manages thread lifecycle, analyzes hardware topology via Mensor,
-/// resolves system dependencies (Vexillum), and orchestrates frame execution.
+/// Supreme commander of the scheduler. Manages worker Centurions, DAG phase planning (Consilium),
+/// hybrid initial-slice + Optio work stealing, exact phase barriers, and lifecycle cleanup.
 /// </summary>
-public class Legatus : IDisposable
+public sealed class Legatus : IDisposable
 {
-    // --- INTEL (Augurium) ---
+    private const int EpochRingSize = 64;
+    private const int EpochRingMask = EpochRingSize - 1;
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct PaddedLong
+    {
+        [FieldOffset(0)]
+        public long Value;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Gradus
+    {
+        public int StartIndex;
+        public int Count;
+    }
+
+    // --- CONFIG & INTEL (Augurium) ---
+    private readonly LegatusConfig _config;
     private readonly Scriba _scriba;
     private readonly Trecenarius _trecenarius;
     private readonly Sanctum _sanctum;
-    private readonly Topologia _topologia; // Noun: Latin
+    private readonly Topologia _topologia;
 
     // --- ARMY (Exercitus) ---
-    private readonly Centurio[] _centurions; 
-    
-    // The master registry of all cohorts
-    private readonly Cohors[] _tabularium; 
-    
-    // The sorted execution order (flat array)
-    private Cohors[] _ordo; 
-    
-    private int _cohortCount;
+    private readonly Centurio[] _centurions;
+    private readonly PhaseFrame[] _phaseRing;
+    private PaddedLong _phaseEpoch;
 
-    // --- TACTICS (Consilium) ---
-    // "Gradus" = Step/Stage/Phase of the battle
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Gradus 
-    { 
-        public int StartIndex; 
-        public int Count; 
-    }
-    
-    // The Battle Plan consists of sequential steps (phases)
+    // --- REGISTRY & CONSILIUM ---
+    private readonly Cohors[] _tabularium;
+    private readonly IPriorPilus[] _commanders;
+    private readonly Cohors[] _ordo;
     private readonly Gradus[] _consilium;
+    private readonly int[] _phaseCounts;
+    private readonly int[] _phaseOffsets;
+    private int _cohortCount;
     private int _gradusCount;
 
-    /// <summary>
-    /// Creates a new Legion.
-    /// Automatically attempts to locate the 'Legio.Haruspex' library for intelligence.
-    /// </summary>
-    /// <param name="maxCohorts">Maximum number of systems supported (default 64).</param>
-    public Legatus(int maxCohorts = 64)
+    private long _frameCounter;
+    private bool _disposed;
+
+    public int ThreadCount => _centurions.Length;
+    public int GradusCount => _gradusCount;
+    public Topologia Topologia => _topologia;
+    public Scriba Scriba => _scriba;
+    public bool IsHaruspexLoaded { get; }
+    public OraculumModel ActiveOracleModel => _config.OracleModel;
+    public long OracleRitualCount => _sanctum.RitualCount;
+    public SystemTelemetry CurrentSystemTelemetry => _sanctum.CurrentTelemetry;
+
+    internal long CurrentEpoch
     {
-        // 1. Survey the Terrain
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Volatile.Read(ref _phaseEpoch.Value);
+    }
+
+    /// <summary>
+    /// Creates a new Legion with default configuration and the specified max cohort count.
+    /// </summary>
+    public Legatus(int maxCohorts = 64)
+        : this(new LegatusConfig { MaxCohorts = maxCohorts })
+    {
+    }
+
+    /// <summary>
+    /// Creates a new Legion configured by <paramref name="config"/>.
+    /// </summary>
+    public Legatus(LegatusConfig config)
+    {
+        _config = config ?? throw new ArgumentNullException(nameof(config));
+        if (_config.MaxCohorts <= 0)
+            throw new ArgumentOutOfRangeException(nameof(config), "MaxCohorts must be positive.");
+
         _topologia = Mensor.Result;
 
-        // 2. Auto-Wire the Oracle (Dynamic Loading)
-        OraculumFunc oracleDelegate = LoadOraculum();
+        int threadCount = _config.ThreadCount > 0
+            ? _config.ThreadCount
+            : Math.Max(1, _topologia.LogicalCoreCount);
 
-        // 3. Initialize Intelligence
-        _scriba = new Scriba();
-        _trecenarius = new Trecenarius();
-        _sanctum = new Sanctum(_trecenarius, _scriba, oracleDelegate);
+        OraculumBatchFunc oracleDelegate = LoadOraculum(threadCount, out bool loadedHaruspex);
+        IsHaruspexLoaded = loadedHaruspex;
 
-        // 4. Initialize Troops
-        // Determine army size based on logical cores
-        int threadCount = _topologia.LogicalCoreCount;
-        _centurions = new Centurio[threadCount];
-        
-        for (int i = 0; i < threadCount; i++)
+        _scriba = new Scriba(_config.MaxCohorts, _config.InitialBatchSize, threadCount);
+        _trecenarius = new Trecenarius(_config.CirculusCapacity);
+        _sanctum = new Sanctum(
+            trecenarius: _trecenarius,
+            scriba: _scriba,
+            oracleLogic: oracleDelegate,
+            maxCohorts: _config.MaxCohorts,
+            oracleIntervalMs: _config.OracleIntervalMs,
+            cpuMonitorIntervalMs: _config.CpuMonitorIntervalMs,
+            diagnosticSink: _config.DiagnosticSink);
+
+        _phaseRing = new PhaseFrame[EpochRingSize];
+        for (int i = 0; i < EpochRingSize; i++)
         {
-            _centurions[i] = new Centurio(i, _trecenarius);
+            _phaseRing[i] = new PhaseFrame(i, _config.MaxCohorts, threadCount);
         }
 
-        // Link for work stealing topology
-        foreach (var c in _centurions) c.Enlist(_centurions);
+        _centurions = new Centurio[threadCount];
+        for (int i = 0; i < threadCount; i++)
+        {
+            _centurions[i] = new Centurio(
+                id: i,
+                legatus: this,
+                trecenarius: _trecenarius,
+                maxCohorts: _config.MaxCohorts,
+                optioCapacity: _config.OptioCapacity,
+                isBackgroundWorker: i > 0);
+        }
 
-        // Start background workers (skip 0, as 0 is the calling thread/Primus)
-        for (int i = 1; i < threadCount; i++) _centurions[i].Start();
+        for (int i = 0; i < threadCount; i++)
+        {
+            _centurions[i].Enlist(_centurions);
+        }
 
-        // Start Intelligence Loop
+        for (int i = 1; i < threadCount; i++)
+        {
+            _centurions[i].Start();
+        }
+
         _sanctum.Start();
 
-        // 5. Initialize Logistics
-        _tabularium = new Cohors[maxCohorts];
-        _ordo = new Cohors[maxCohorts];
-        _consilium = new Gradus[32]; // Support up to 32 dependency phases
+        _tabularium = new Cohors[_config.MaxCohorts];
+        _commanders = new IPriorPilus[_config.MaxCohorts];
+        _ordo = new Cohors[_config.MaxCohorts];
+        _consilium = new Gradus[_config.MaxCohorts];
+        _phaseCounts = new int[_config.MaxCohorts];
+        _phaseOffsets = new int[_config.MaxCohorts];
     }
 
     /// <summary>
     /// Enlists a new Cohort (System) into the Legion.
+    /// Registration order is binding for resource hazards (RAW / WAR / WAW).
     /// </summary>
     public void RegisterCohors(Cohors cohors)
     {
-        if (_cohortCount >= _tabularium.Length)
-            throw new InvalidOperationException("Tabularium is full. Increase maxCohorts.");
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(cohors);
 
-        _tabularium[_cohortCount++] = cohors;
+        if (_cohortCount >= _tabularium.Length)
+            throw new InvalidOperationException("Tabularium is full. Increase LegatusConfig.MaxCohorts.");
+
+        int slot = _cohortCount++;
+        cohors.Slot = slot;
+        _tabularium[slot] = cohors;
+        _commanders[slot] = cohors.Commander;
     }
 
     /// <summary>
-    /// Constructs the Battle Plan (Consilium) based on dependencies.
-    /// Uses a Greedy Topological Sort to maximize parallelism while respecting Vexillum masks.
+    /// Constructs the Battle Plan (Consilium) as a hazard-preserving DAG (RAW, WAR, WAW).
+    /// Registration order is binding for any cohorts sharing a conflicting resource bit,
+    /// guaranteeing zero deadlocks and exact sequential semantics while maximizing parallelism.
     /// </summary>
     public void ConstructConsilium()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         _gradusCount = 0;
+        if (_cohortCount == 0)
+            return;
 
-        // Temporary tracking
-        // Using a pooled array or simple heap allocation (once per startup) is acceptable.
-        bool[] assigned = new bool[_cohortCount]; 
-        int assignedCount = 0;
-        int execIndex = 0;
+        Array.Clear(_phaseCounts, 0, _cohortCount);
+        int maxPhase = 0;
 
-        // Clear the order buffer
-        Array.Clear(_ordo, 0, _cohortCount);
-
-        // --- GREEDY TOPOLOGICAL SORT ---
-        while (assignedCount < _cohortCount)
+        // 1. Compute earliest legal phase for each cohort respecting all earlier hazards (RAW/WAR/WAW).
+        //    Since edges only go forward (j < i), the resulting dependency graph is strictly acyclic (0 deadlocks).
+        for (int i = 0; i < _cohortCount; i++)
         {
-            int stepStartIndex = execIndex;
-            
-            // Territory masks for the current step (Gradus)
-            Vexillum gradusWrites = new Vexillum();
-            Vexillum gradusReads = new Vexillum();
+            Cohors current = _tabularium[i];
+            int earliestPhase = 0;
 
-            for (int i = 0; i < _cohortCount; i++)
+            for (int j = 0; j < i; j++)
             {
-                if (assigned[i]) continue;
+                Cohors prev = _tabularium[j];
 
-                var candidate = _tabularium[i];
+                bool waw = prev.WriteMask.Confligere(in current.WriteMask);
+                bool raw = prev.WriteMask.Confligere(in current.ReadMask);
+                bool war = prev.ReadMask.Confligere(in current.WriteMask);
 
-                // CONFLICT CHECKS (Confligerea)
-                // 1. Write-Write Conflict
-                bool writeConflict = gradusWrites.Confligerea(candidate.WriteMask);
-                // 2. Read-Write Conflict
-                bool readWriteConflict = gradusReads.Confligerea(candidate.WriteMask);
-                // 3. Write-Read Conflict
-                bool writeReadConflict = gradusWrites.Confligerea(candidate.ReadMask);
-
-                if (!writeConflict && !readWriteConflict && !writeReadConflict)
+                if (waw || raw || war)
                 {
-                    // Recruit to current Gradus
-                    _ordo[execIndex++] = candidate;
-                    candidate.PhaseIndex = _gradusCount; 
-                    assigned[i] = true;
-                    assignedCount++;
-
-                    // Expand territory
-                    gradusWrites.Iungere(candidate.WriteMask);
-                    gradusReads.Iungere(candidate.ReadMask);
+                    int candidatePhase = prev.PhaseIndex + 1;
+                    if (candidatePhase > earliestPhase)
+                        earliestPhase = candidatePhase;
                 }
             }
 
-            // Record the step boundaries
-            _consilium[_gradusCount++] = new Gradus 
-            { 
-                StartIndex = stepStartIndex, 
-                Count = execIndex - stepStartIndex 
-            };
+            current.PhaseIndex = earliestPhase;
+            _phaseCounts[earliestPhase]++;
+            if (earliestPhase > maxPhase)
+                maxPhase = earliestPhase;
+        }
 
-            // Deadlock detection
-            if (execIndex == stepStartIndex)
-            {
-                throw new InvalidOperationException("Deadlock detected in Consilium. Cyclic dependency in Vexillum masks.");
-            }
+        // 2. Pack cohorts into flat _ordo array grouped by phase (preserving registration order inside each phase).
+        _gradusCount = maxPhase + 1;
+        int offset = 0;
+        for (int p = 0; p < _gradusCount; p++)
+        {
+            int count = _phaseCounts[p];
+            _consilium[p] = new Gradus { StartIndex = offset, Count = count };
+            _phaseOffsets[p] = offset;
+            offset += count;
+        }
+
+        for (int i = 0; i < _cohortCount; i++)
+        {
+            Cohors c = _tabularium[i];
+            int dst = _phaseOffsets[c.PhaseIndex]++;
+            _ordo[dst] = c;
         }
     }
 
     /// <summary>
-    /// Commands the Legion to fight one frame.
+    /// Commands the Legion to execute one complete frame across all Consilium phases.
+    /// Guarantees every task in phase p finishes before phase p+1 begins, and all tasks finish before returning.
     /// </summary>
     public void ExecuteFrame()
     {
-        var primus = _centurions[0];
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // 1. Wake up the army (Background threads)
-        for (int i = 1; i < _centurions.Length; i++) _centurions[i].WakeUp();
+        long frameIndex = ++_frameCounter;
+        int stride = _config.TelemetrySampleStride <= 1 ? 1 : _config.TelemetrySampleStride;
+        bool recordTelemetry = (frameIndex % stride) == 0;
+        Centurio primus = _centurions[0];
 
-        // 2. Iterate through the Plan (Consilium)
         for (int p = 0; p < _gradusCount; p++)
         {
             Gradus gradus = _consilium[p];
+            if (gradus.Count == 0)
+                continue;
 
-            // A. DISPATCH ORDERS
-            // Push tasks to the Main Thread's queue (Primus).
-            // Other threads will steal from here.
-            for (int i = 0; i < gradus.Count; i++)
+            long nextEpoch = _phaseEpoch.Value + 1;
+            int ringSlot = (int)(nextEpoch & EpochRingMask);
+
+            // Safety guard: ensure no preempted worker still references this ring slot from 8 epochs ago.
+            long staleEpoch = nextEpoch - EpochRingSize;
+            if (staleEpoch > 0)
             {
-                var cohors = _ordo[gradus.StartIndex + i];
-                cohors.Commander.ExecuteBattleOrders(_scriba, primus);
+                WaitForStaleEpochDrain(staleEpoch);
             }
 
-            // B. FIGHT (Work Stealing Loop)
-            // The Main Thread participates in the battle.
-            // This method blocks until the local queue is empty AND stealing fails.
-            primus.ProcessLocalAndSteal();
+            PhaseFrame frame = _phaseRing[ringSlot];
+            int activeItemCount = 0;
+            int maxActiveThreads = 1;
+            long totalPhaseChunks = 0;
+            StealMode phaseStealMode = StealMode.StealOne;
+            int phaseAffinityHint = 0;
+            int phaseSpinBudget = 64;
 
-            // C. SYNCHRONIZATION
-            // Implicit barrier: Since tasks in Gradus N+1 require data from Gradus N,
-            // and ProcessLocalAndSteal drains all available work, we naturally wait here.
+            for (int i = 0; i < gradus.Count; i++)
+            {
+                Cohors cohors = _ordo[gradus.StartIndex + i];
+                int totalItems = cohors.Commander.GetTotalItemCount();
+                if (totalItems <= 0)
+                    continue;
+
+                Strategia strat = _scriba.Legere(cohors.Slot);
+                int activeThreads = Math.Clamp(strat.ThreadCount, 1, _centurions.Length);
+                if (totalItems < activeThreads)
+                    activeThreads = totalItems;
+
+                int batchSize = Math.Clamp(strat.BatchSize, 1, totalItems);
+                int totalChunks = (int)(((long)totalItems + batchSize - 1) / batchSize);
+
+                frame.CohortHalfBoundary[cohors.Slot] = totalItems >> 1;
+                frame.Items[activeItemCount++] = new CohortWorkItem
+                {
+                    CohortSlot = cohors.Slot,
+                    CohortId = cohors.Id,
+                    TotalItems = totalItems,
+                    BatchSize = batchSize,
+                    TotalChunks = totalChunks,
+                    ActiveThreads = activeThreads,
+                    PartitionMode = strat.PartitionMode,
+                    StealMode = strat.StealMode
+                };
+
+                totalPhaseChunks += totalChunks;
+                if (activeThreads > maxActiveThreads)
+                    maxActiveThreads = activeThreads;
+                if (strat.StealMode == StealMode.StealHalf)
+                    phaseStealMode = StealMode.StealHalf;
+                if (strat.AffinityHint > phaseAffinityHint)
+                    phaseAffinityHint = strat.AffinityHint;
+
+                int spin = strat.SpinIterationsBeforePark > 0
+                    ? Math.Clamp(strat.SpinIterationsBeforePark, 64, 4096)
+                    : 1024;
+                if (spin > phaseSpinBudget)
+                    phaseSpinBudget = spin;
+            }
+
+            if (totalPhaseChunks == 0)
+                continue;
+
+            frame.ItemCount = activeItemCount;
+            frame.MaxActiveThreads = maxActiveThreads;
+            frame.RecordTelemetry = recordTelemetry;
+            frame.CpuPressure = _sanctum.CurrentCpuPressure;
+            frame.StealMode = phaseStealMode;
+            frame.AffinityHint = phaseAffinityHint;
+            frame.SpinIterationsBeforePark = phaseSpinBudget;
+
+            for (int w = 0; w < maxActiveThreads; w++)
+            {
+                frame.InboxClaimed[w].Value = 0;
+            }
+
+            // 1. Publish phase work count and epoch with full memory barrier BEFORE waking workers.
+            frame.SetRemainingTasks(totalPhaseChunks);
+            Interlocked.Exchange(ref _phaseEpoch.Value, nextEpoch);
+
+            // 2. Wake only the workers participating in this phase (Dekker check skips syscalls when spinning).
+            for (int w = 1; w < maxActiveThreads; w++)
+            {
+                _centurions[w].WakeUpIfParked();
+            }
+
+            // 3. Primus joins the battle and enforces the exact phase barrier (frame.RemainingTasks == 0).
+            primus.RunPhase(nextEpoch);
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic helper: total chunks stolen across all Centurions since startup.
+    /// </summary>
+    public long GetTotalSteals()
+    {
+        long sum = 0;
+        for (int i = 0; i < _centurions.Length; i++)
+            sum += _centurions[i].TotalSteals;
+        return sum;
+    }
+
+    /// <summary>
+    /// Diagnostic helper: total chunks executed across all Centurions since startup.
+    /// </summary>
+    public long GetTotalTasksExecuted()
+    {
+        long sum = 0;
+        for (int i = 0; i < _centurions.Length; i++)
+            sum += _centurions[i].TotalTasksExecuted;
+        return sum;
+    }
+
+    /// <summary>
+    /// Diagnostic helper: returns the phase index assigned to the cohort at registration index <paramref name="slot"/>.
+    /// </summary>
+    public int GetCohortPhase(int slot) => _tabularium[slot].PhaseIndex;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal IPriorPilus GetCommander(int cohortSlot) => _commanders[cohortSlot];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal PhaseFrame GetPhaseFrame(long epoch) => _phaseRing[(int)(epoch & EpochRingMask)];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal PhaseFrame GetPhaseFrameBySlot(int slot) => _phaseRing[slot];
+
+    private void WaitForStaleEpochDrain(long staleEpoch)
+    {
+        var spin = new SpinWait();
+        for (int i = 1; i < _centurions.Length; i++)
+        {
+            while (_centurions[i].ActiveEpoch == staleEpoch)
+            {
+                spin.SpinOnce(sleep1Threshold: -1);
+            }
         }
     }
 
     public void Dispose()
     {
-        // TODO: Signal shutdown to threads
+        if (_disposed) return;
+        _disposed = true;
+
+        _sanctum.Dispose();
+
+        for (int i = 1; i < _centurions.Length; i++)
+        {
+            _centurions[i].Dispose();
+        }
+        _centurions[0].Dispose();
     }
 
     // ==========================================
     // AUTO-WIRING LOGIC (REFLECTION)
     // ==========================================
 
-    /// <summary>
-    /// Attempts to load the F# Oracle from 'Legio.Haruspex.dll'.
-    /// Creates a high-performance open delegate if found.
-    /// Falls back to a dummy C# implementation if missing.
-    /// </summary>
-    private OraculumFunc LoadOraculum()
+    private OraculumBatchFunc LoadOraculum(int threadCount, out bool loadedHaruspex)
     {
+        loadedHaruspex = false;
         try
         {
-            // Try to load the assembly (it should be alongside Legio.Core.dll in the NuGet package)
             var assemblyName = new AssemblyName("Legio.Haruspex");
-            Assembly assembly;
-            
-            try 
-            {
-                assembly = Assembly.Load(assemblyName);
-            }
-            catch 
-            {
-                // If not found in GAC/Context, try local file (helpful for debug)
-                return FallbackOraculum;
-            }
+            Assembly assembly = Assembly.Load(assemblyName);
 
-            if (assembly != null)
+            Type? oracleType = assembly.GetType("Legio.Haruspex.Oracle");
+            MethodInfo? createMethod = oracleType?.GetMethod("createEngine", BindingFlags.Public | BindingFlags.Static);
+
+            if (createMethod != null)
             {
-                // F# modules compile to static classes.
-                // We look for the "Oracle" module and "divine" function.
-                var oracleType = assembly.GetType("Legio.Haruspex.Oracle");
-                if (oracleType != null)
+                object? engine = createMethod.Invoke(
+                    null,
+                    new object[] { _config.MaxCohorts, _config.OracleModel, threadCount, _config.InitialBatchSize });
+
+                if (engine != null)
                 {
-                    var divineMethod = oracleType.GetMethod("divine", BindingFlags.Public | BindingFlags.Static);
-                    if (divineMethod != null)
+                    MethodInfo? evaluateMethod = engine.GetType().GetMethod("Evaluate", BindingFlags.Public | BindingFlags.Instance);
+                    if (evaluateMethod != null)
                     {
-                        // Create a Delegate. 
-                        // This removes Reflection overhead for subsequent calls.
-                        // It binds the method info to the delegate type strictly.
-                        return (OraculumFunc)Delegate.CreateDelegate(typeof(OraculumFunc), divineMethod);
+                        loadedHaruspex = true;
+                        return (OraculumBatchFunc)Delegate.CreateDelegate(typeof(OraculumBatchFunc), engine, evaluateMethod);
                     }
                 }
             }
+
+            _config.DiagnosticSink?.Invoke("Legio.Haruspex loaded, but Oracle.createEngine/Evaluate was not found. Using fallback.");
         }
-        catch 
+        catch (Exception ex)
         {
-            // TODO: Loging or error handling here.
+            _config.DiagnosticSink?.Invoke($"Failed to load Legio.Haruspex ({ex.GetType().Name}: {ex.Message}). Using fallback.");
         }
 
-        // If anything fails, use the safe fallback
         return FallbackOraculum;
     }
 
-    /// <summary>
-    /// A dummy strategy used if the F# library is missing or fails to load.
-    /// Ensures the engine still runs, just without ML optimization.
-    /// </summary>
-    private static Strategia FallbackOraculum(Topologia topo, ReadOnlySpan<Tessera> omens)
+    private void FallbackOraculum(
+        in Topologia topo,
+        in SystemTelemetry telemetry,
+        ReadOnlySpan<Tessera> omens,
+        Span<Strategia> strategiesOut,
+        Span<byte> updatedMask)
     {
-        // Conservative default strategy
-        return new Strategia 
-        { 
-            BatchSize = 1024, 
-            ThreadCount = topo.LogicalCoreCount,
+        int threads = Math.Clamp(_centurions?.Length ?? topo.LogicalCoreCount, 1, Math.Max(1, topo.LogicalCoreCount));
+        var fallback = new Strategia
+        {
+            BatchSize = Math.Max(16, _config.InitialBatchSize),
+            ThreadCount = threads,
             Confidence = 0.5f,
-            AffinityHint = 0
+            AffinityHint = telemetry.ExternalCpuLoad > 0.5f ? (int)AffinityMode.PhysicalCoresFirst : (int)AffinityMode.None,
+            SpinIterationsBeforePark = telemetry.ExternalCpuLoad > 0.5f ? 256 : 1024,
+            PartitionMode = PartitionMode.Contiguous,
+            StealMode = StealMode.StealOne
         };
+
+        int limit = Math.Min(strategiesOut.Length, updatedMask.Length);
+        for (int i = 0; i < omens.Length; i++)
+        {
+            int c = omens[i].CohortId;
+            if ((uint)c < (uint)limit && updatedMask[c] == 0)
+            {
+                strategiesOut[c] = fallback;
+                updatedMask[c] = 1;
+            }
+        }
     }
 }

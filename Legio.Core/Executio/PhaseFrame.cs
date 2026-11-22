@@ -1,0 +1,84 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using Legio.Protocol;
+
+namespace Legio.Core.Executio;
+
+/// <summary>
+/// Pre-allocated descriptor for one Cohort participating in an execution phase (Gradus).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct CohortWorkItem
+{
+    public int CohortSlot;
+    public int CohortId;
+    public int TotalItems;
+    public int BatchSize;
+    public int TotalChunks;
+    public int ActiveThreads;
+    public PartitionMode PartitionMode;
+    public StealMode StealMode;
+}
+
+/// <summary>
+/// Pre-allocated phase frame stored in the epoch ring inside Legatus.
+/// Owns its own cache-line-padded RemainingTasks counter so consecutive phases never interfere.
+/// </summary>
+internal sealed class PhaseFrame
+{
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct PaddedLong
+    {
+        [FieldOffset(0)]
+        public long Value;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    internal struct PaddedInt
+    {
+        [FieldOffset(0)]
+        public int Value;
+    }
+
+    public readonly CohortWorkItem[] Items;
+    public readonly PaddedInt[] InboxClaimed;
+    public readonly int[] CohortHalfBoundary;
+    public readonly int Slot;
+
+    private PaddedLong _remainingTasks;
+
+    public int ItemCount;
+    public int MaxActiveThreads;
+    public bool RecordTelemetry;
+    public float CpuPressure;
+    public StealMode StealMode;
+    public int AffinityHint;
+    public int SpinIterationsBeforePark;
+
+    public PhaseFrame(int slot, int maxCohorts, int maxThreads)
+    {
+        Slot = slot;
+        Items = new CohortWorkItem[maxCohorts];
+        InboxClaimed = new PaddedInt[maxThreads];
+        CohortHalfBoundary = new int[maxCohorts];
+        SpinIterationsBeforePark = 1024;
+    }
+
+    public long RemainingTasks
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Volatile.Read(ref _remainingTasks.Value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetRemainingTasks(long count)
+    {
+        Volatile.Write(ref _remainingTasks.Value, count);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public long DecrementRemainingTasks()
+    {
+        return Interlocked.Decrement(ref _remainingTasks.Value);
+    }
+}

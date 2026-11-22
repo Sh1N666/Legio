@@ -1,0 +1,410 @@
+using Legio.Core;
+using Legio.Core.Executio;
+using Legio.Protocol;
+using Xunit;
+
+namespace Legio.Tests;
+
+public class LegatusExecutionTests
+{
+    private sealed class IncrementSystem(int id, int[] buffer) : PriorPilus(id)
+    {
+        protected override int GetTotalItemCount() => buffer.Length;
+
+        protected override void ExecuteBatchLogic(int start, int length)
+        {
+            for (int i = start; i < start + length; i++)
+            {
+                buffer[i]++;
+            }
+        }
+    }
+
+    private sealed class PipelineStageSystem(int id, int[] input, int[] output, Func<int, int> transform) : PriorPilus(id)
+    {
+        protected override int GetTotalItemCount() => output.Length;
+
+        protected override void ExecuteBatchLogic(int start, int length)
+        {
+            for (int i = start; i < start + length; i++)
+            {
+                output[i] = transform(input[i]);
+            }
+        }
+    }
+
+    private sealed class SkewedWorkloadSystem(int id, float[] data) : PriorPilus(id)
+    {
+        protected override int GetTotalItemCount() => data.Length;
+
+        protected override void ExecuteBatchLogic(int start, int length)
+        {
+            int heavyBoundary = data.Length / 8; // First 12.5% is 80x heavier -> forces intense Optio stealing
+            for (int i = start; i < start + length; i++)
+            {
+                float v = data[i];
+                int iters = i < heavyBoundary ? 160 : 2;
+                for (int j = 0; j < iters; j++)
+                {
+                    v = MathF.Sin(v) * MathF.Cos(v) + 1.0f;
+                }
+                data[i] = v;
+            }
+        }
+    }
+
+    [Fact]
+    public void ExecuteFrame_CompletesAllItemsBeforeReturning_AcrossManyConsecutiveFrames()
+    {
+        const int itemCount = 100_000;
+        const int frames = 40;
+        var buffer = new int[itemCount];
+
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 8,
+            ThreadCount = Math.Min(8, Environment.ProcessorCount),
+            InitialBatchSize = 256,
+            OracleIntervalMs = 50,
+            OracleModel = OraculumModel.FuzzySugeno
+        });
+
+        var sys = new IncrementSystem(0, buffer);
+        var cohors = new Cohors(0, sys);
+        cohors.WriteMask.Tollere(0);
+
+        legatus.RegisterCohors(cohors);
+        legatus.ConstructConsilium();
+
+        for (int f = 1; f <= frames; f++)
+        {
+            legatus.ExecuteFrame();
+
+            // Immediately after ExecuteFrame returns, every single element MUST already equal `f`.
+            // (If phase barrier were missing, straggling worker threads would cause stale reads here.)
+            for (int i = 0; i < itemCount; i++)
+            {
+                if (buffer[i] != f)
+                {
+                    Assert.Fail($"Frame {f}: index {i} expected {f}, got {buffer[i]} (barrier failure!).");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void MultiPhasePipeline_EnforcesStrictBarrierBetweenDependentPhases()
+    {
+        const int n = 65_536;
+        const int frames = 30;
+        var a = new int[n];
+        var b = new int[n];
+        var c = new int[n];
+
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 8,
+            ThreadCount = Math.Min(8, Environment.ProcessorCount),
+            InitialBatchSize = 512,
+            OracleModel = OraculumModel.OrderedFuzzyNumbers
+        });
+
+        // Phase 0: a[i]++
+        var c0 = new Cohors(0, new IncrementSystem(0, a));
+        c0.WriteMask.Tollere(0);
+
+        // Phase 1: b[i] = a[i] * 3
+        var c1 = new Cohors(1, new PipelineStageSystem(1, a, b, static x => x * 3));
+        c1.ReadMask.Tollere(0);
+        c1.WriteMask.Tollere(1);
+
+        // Phase 2: c[i] = b[i] + 7
+        var c2 = new Cohors(2, new PipelineStageSystem(2, b, c, static x => x + 7));
+        c2.ReadMask.Tollere(1);
+        c2.WriteMask.Tollere(2);
+
+        legatus.RegisterCohors(c0);
+        legatus.RegisterCohors(c1);
+        legatus.RegisterCohors(c2);
+        legatus.ConstructConsilium();
+
+        Assert.Equal(3, legatus.GradusCount);
+
+        for (int f = 1; f <= frames; f++)
+        {
+            legatus.ExecuteFrame();
+
+            int expectedC = f * 3 + 7;
+            for (int i = 0; i < n; i++)
+            {
+                if (c[i] != expectedC)
+                {
+                    Assert.Fail($"Frame {f}: c[{i}] expected {expectedC}, got {c[i]}.");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void SkewedWorkload_TriggersRealOptioWorkStealing_AndProducesExactResults()
+    {
+        const int n = 32_768;
+        var data = new float[n];
+        var expected = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float v = (i % 97) * 0.1f;
+            data[i] = v;
+            expected[i] = v;
+        }
+
+        // Compute single-threaded reference
+        var referenceSys = new SkewedWorkloadSystem(99, expected);
+        ((IPriorPilus)referenceSys).ExecuteBatch(0, n);
+
+        int threads = Math.Max(2, Math.Min(8, Environment.ProcessorCount));
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            ThreadCount = threads,
+            InitialBatchSize = 128, // Multiple chunks per worker so idle threads can steal from heavy worker 0
+            OracleModel = OraculumModel.FuzzySugeno
+        });
+
+        var sys = new SkewedWorkloadSystem(0, data);
+        var cohors = new Cohors(0, sys);
+        cohors.WriteMask.Tollere(0);
+        legatus.RegisterCohors(cohors);
+        legatus.ConstructConsilium();
+
+        legatus.ExecuteFrame();
+
+        Assert.True(legatus.GetTotalSteals() > 0, "Expected idle Centurions to steal heavy chunks via Optio.");
+
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal(expected[i], data[i], precision: 5);
+        }
+    }
+
+    [Theory]
+    [InlineData(OraculumModel.StaticHeuristic)]
+    [InlineData(OraculumModel.FuzzySugeno)]
+    [InlineData(OraculumModel.OrderedFuzzyNumbers)]
+    [InlineData(OraculumModel.ContextualBandit)]
+    [InlineData(OraculumModel.OnlineLinUcb)]
+    public void ExecuteFrame_ZeroAllocationsOnCallingThread_AndHaruspexLoadsCleanly(OraculumModel model)
+    {
+        const int n = 32_768;
+        var buffer = new int[n];
+        string? diagError = null;
+
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 8,
+            ThreadCount = Math.Min(4, Environment.ProcessorCount),
+            InitialBatchSize = 512,
+            OracleModel = model,
+            OracleIntervalMs = 25,
+            DiagnosticSink = msg => diagError = msg
+        });
+
+        Assert.True(legatus.IsHaruspexLoaded, $"Haruspex F# Oracle failed to load: {diagError}");
+        Assert.Null(diagError);
+
+        var cohors = new Cohors(0, new IncrementSystem(0, buffer));
+        cohors.WriteMask.Tollere(0);
+        legatus.RegisterCohors(cohors);
+        legatus.ConstructConsilium();
+
+        // Warmup frames (JIT + let Sanctum complete at least one periodic ML ritual)
+        for (int i = 0; i < 10; i++)
+        {
+            legatus.ExecuteFrame();
+        }
+        Thread.Sleep(70);
+        for (int i = 0; i < 5; i++)
+        {
+            legatus.ExecuteFrame();
+        }
+
+        Assert.True(legatus.OracleRitualCount > 0, "Expected periodic Sanctum thread to invoke Haruspex ML Oracle.");
+
+        // Measure strict zero allocation on ExecuteFrame hot path
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 25; i++)
+        {
+            legatus.ExecuteFrame();
+        }
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        Assert.Equal(0L, after - before);
+    }
+
+    [Fact]
+    public void InterleavedPartition_AndStealHalf_AndAffinity_ExecuteEveryElementExactlyOnce()
+    {
+        // Odd non-power-of-two item count + non-multiple batch size tests every boundary case of Interleaved & StealHalf.
+        const int itemCount = 37_123;
+        const int frames = 20;
+        var buffer = new int[itemCount];
+
+        int threads = Math.Max(2, Math.Min(8, Environment.ProcessorCount));
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            ThreadCount = threads,
+            InitialBatchSize = 137,
+            OracleIntervalMs = 5000, // Keep manual strategy active during test
+            OracleModel = OraculumModel.StaticHeuristic
+        });
+
+        var cohors = new Cohors(0, new IncrementSystem(0, buffer));
+        cohors.WriteMask.Tollere(0);
+        legatus.RegisterCohors(cohors);
+        legatus.ConstructConsilium();
+
+        // Force Option B strategy: Interleaved + StealHalf + PhysicalCoresFirst + custom Spin budget
+        var forced = new Strategia
+        {
+            BatchSize = 137,
+            ThreadCount = threads,
+            Confidence = 0.9f,
+            AffinityHint = (int)AffinityMode.PhysicalCoresFirst,
+            SpinIterationsBeforePark = 512,
+            PartitionMode = PartitionMode.Interleaved,
+            StealMode = StealMode.StealHalf
+        };
+        legatus.Scriba.Scribere(0, in forced);
+
+        for (int f = 1; f <= frames; f++)
+        {
+            legatus.ExecuteFrame();
+
+            for (int i = 0; i < itemCount; i++)
+            {
+                if (buffer[i] != f)
+                {
+                    Assert.Fail($"Interleaved/StealHalf frame {f}: index {i} expected {f}, got {buffer[i]}.");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void StealHalf_WithRapidlyChangingThreadCount_NeverDeadlocks()
+    {
+        // Regression test: exercises rapid ThreadCount shrinkage (16 -> 3 -> 8 -> 2 -> 16)
+        // combined with StealHalf + Interleaved across 150 back-to-back 2-phase frames.
+        const int n = 24_576;
+        var a = new int[n];
+        var b = new int[n];
+
+        int maxT = Math.Max(4, Math.Min(16, Environment.ProcessorCount));
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            ThreadCount = maxT,
+            InitialBatchSize = 64,
+            OracleIntervalMs = 5000,
+            OracleModel = OraculumModel.StaticHeuristic
+        });
+
+        var c0 = new Cohors(0, new IncrementSystem(0, a));
+        c0.WriteMask.Tollere(0);
+        var c1 = new Cohors(1, new PipelineStageSystem(1, a, b, static x => x * 2));
+        c1.ReadMask.Tollere(0);
+        c1.WriteMask.Tollere(1);
+
+        legatus.RegisterCohors(c0);
+        legatus.RegisterCohors(c1);
+        legatus.ConstructConsilium();
+
+        int[] threadSchedule = [maxT, 3, maxT, 2, Math.Max(2, maxT / 2), 1, maxT, 3];
+        for (int f = 1; f <= 150; f++)
+        {
+            int t0 = threadSchedule[f % threadSchedule.Length];
+            int t1 = threadSchedule[(f + 1) % threadSchedule.Length];
+
+            var s0 = new Strategia
+            {
+                BatchSize = 64,
+                ThreadCount = t0,
+                Confidence = 0.9f,
+                AffinityHint = 0,
+                SpinIterationsBeforePark = 512,
+                PartitionMode = (f & 1) == 0 ? PartitionMode.Interleaved : PartitionMode.Contiguous,
+                StealMode = StealMode.StealHalf
+            };
+            var s1 = s0;
+            s1.ThreadCount = t1;
+
+            legatus.Scriba.Scribere(0, in s0);
+            legatus.Scriba.Scribere(1, in s1);
+            legatus.ExecuteFrame();
+        }
+
+        Assert.All(b, v => Assert.Equal(300, v));
+    }
+
+    [Fact]
+    public void Dispose_CleanlyShutsDownRepeatedInstances_WithoutHanging()
+    {
+        var buffer = new int[4096];
+
+        for (int round = 0; round < 5; round++)
+        {
+            using var legatus = new Legatus(new LegatusConfig
+            {
+                MaxCohorts = 4,
+                ThreadCount = Math.Min(4, Environment.ProcessorCount),
+                OracleIntervalMs = 20,
+                OracleModel = (OraculumModel)(round % 5)
+            });
+
+            var cohors = new Cohors(0, new IncrementSystem(0, buffer));
+            cohors.WriteMask.Tollere(0);
+            legatus.RegisterCohors(cohors);
+            legatus.ConstructConsilium();
+
+            legatus.ExecuteFrame();
+            legatus.ExecuteFrame();
+        }
+
+        Assert.All(buffer, v => Assert.Equal(10, v));
+    }
+
+    [Fact]
+    public void Speculator_Explorare_IsZeroAllocationOnLinux_AndSamplesSystemAndPmuTelemetry()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        using var speculator = new Legio.Core.Augurium.Speculator(updateIntervalMs: 10);
+        // Burn a tiny amount of CPU so counters advance
+        double acc = 0.0;
+        for (int i = 0; i < 200_000; i++) acc += Math.Sqrt(i);
+
+        // Warmup
+        Thread.Sleep(15);
+        speculator.Explorare();
+
+        for (int i = 0; i < 200_000; i++) acc += Math.Sqrt(i + 1);
+        Thread.Sleep(15);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        speculator.Explorare();
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        Assert.Equal(0L, after - before);
+        Assert.InRange(speculator.ProcessCpuLoad, 0.0f, 1.0f);
+        Assert.InRange(speculator.ExternalCpuLoad, 0.0f, 1.0f);
+        Assert.True(speculator.HasExternalCpu, "Expected /proc/stat external CPU telemetry to initialize on Linux.");
+        if (speculator.HasPmuCounters)
+        {
+            Assert.InRange(speculator.InstructionsPerCycle, 0.0f, 8.0f);
+            Assert.InRange(speculator.CacheMissRate, 0.0f, 1.0f);
+        }
+        Assert.True(acc > 0.0);
+    }
+}

@@ -1,116 +1,162 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Legio.Core.Executio;
 
 /// <summary>
-/// Optio (The Deputy).
-/// Manages the local task queue for a Centurion.
-/// Implements a lock-free Work Stealing Deque (Double-Ended Queue).
+/// Distinguishes an empty deque from transient CAS contention during work stealing.
 /// </summary>
-public unsafe class Optio
+public enum StealResult : byte
 {
-    // The actual buffer of tasks. Power of 2 size.
-    private readonly TaskUnit[] _buffer;
-    private readonly int _mask;
+    Empty = 0,
+    Success = 1,
+    Contended = 2
+}
 
-    // Volatile indices for lock-free synchronization
-    private volatile int _head; // Written by Owner (Push/Pop)
-    private volatile int _tail; // Written by Thieves (Steal)
+/// <summary>
+/// Optio (The Deputy).
+/// Lock-free, zero-allocation Chase-Lev Work-Stealing Deque with 64-byte cache-line padding,
+/// 64-bit monotonic indices (no 32-bit overflow/ABA), and explicit contention reporting.
+/// </summary>
+public sealed class Optio
+{
+    private readonly TaskUnit[] _buffer;
+    private readonly long _mask;
+    private readonly int _capacity;
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct PaddedLong
+    {
+        [FieldOffset(0)]
+        public long Value;
+    }
+
+    private PaddedLong _head; // Bottom: mutated only by Owner (TryPush / TryPop)
+    private PaddedLong _tail; // Top: mutated by Thieves (TrySteal) and Owner on last-item race
+
+    public int Capacity => _capacity;
 
     public Optio(int capacity = 4096)
     {
-        _buffer = new TaskUnit[capacity];
+        if (capacity < 2 || (capacity & (capacity - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity), "Capacity must be a power of 2 and at least 2.");
+
+        _capacity = capacity;
         _mask = capacity - 1;
-        _head = 0;
-        _tail = 0;
+        _buffer = new TaskUnit[capacity];
+        _head.Value = 0;
+        _tail.Value = 0;
     }
 
     /// <summary>
-    /// Adds a new task to the local queue (LIFO).
-    /// Only called by the Owner (Centurion).
+    /// Pushes a task onto the local end (LIFO). Owner thread only.
+    /// Returns false if the deque is full (never silently overwrites unread slots).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Push(TaskUnit task)
+    public bool TryPush(in TaskUnit task)
     {
-        int head = _head;
-        _buffer[head & _mask] = task;
-        
-        // Memory fence to ensure the task is visible before incrementing head
-        Interlocked.MemoryBarrier(); 
-        
-        _head = head + 1;
+        long head = _head.Value;
+        long tail = Volatile.Read(ref _tail.Value);
+
+        if (head - tail >= _capacity)
+            return false;
+
+        _buffer[(int)(head & _mask)] = task;
+
+        // Release store: payload must be visible before _head becomes visible to thieves.
+        Volatile.Write(ref _head.Value, head + 1);
+        return true;
     }
 
     /// <summary>
-    /// Takes a task from the local queue (LIFO).
-    /// Only called by the Owner (Centurion).
+    /// Pops a task from the local end (LIFO). Owner thread only.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPop(out TaskUnit task)
     {
-        int head = _head - 1;
-        Interlocked.Exchange(ref _head, head); // Decrement head atomically
+        long head = _head.Value - 1;
 
-        int tail = _tail;
+        // Full memory fence (SeqCst): ensures decremented _head is visible before reading _tail.
+        Interlocked.Exchange(ref _head.Value, head);
+
+        long tail = Volatile.Read(ref _tail.Value);
         if (head < tail)
         {
-            // Queue is empty
-            _head = tail;
+            // Deque was already empty; restore _head to match _tail.
+            Volatile.Write(ref _head.Value, tail);
             task = default;
             return false;
         }
 
-        task = _buffer[head & _mask];
+        task = _buffer[(int)(head & _mask)];
 
-        // Check for race condition with a thief
-        if (head == tail)
+        if (head > tail)
         {
-            int tailNext = tail + 1;
-            // Try to increment tail to win against a thief
-            if (Interlocked.CompareExchange(ref _tail, tailNext, tail) != tail)
-            {
-                // Lost the race to a thief (FAILED POP)
-                _head = tail + 1; // Restore head
-                task = default;
-                return false;
-            }
-            // Won the race, queue is now empty and consistent
-            _head = tail + 1; 
+            // Strictly more than one item existed; no thief can claim index `head`.
+            return true;
+        }
+
+        // Exactly one item left (head == tail): compete with thieves via CAS on _tail.
+        bool won = Interlocked.CompareExchange(ref _tail.Value, tail + 1, tail) == tail;
+
+        // Regardless of outcome, the deque is now empty at tail + 1.
+        Volatile.Write(ref _head.Value, tail + 1);
+
+        if (!won)
+        {
+            task = default;
+            return false;
         }
 
         return true;
     }
 
     /// <summary>
-    /// Steals a task from the other end of the queue (FIFO).
-    /// Called by other Centurions (Thieves).
+    /// Attempts to steal a task from the opposite end (FIFO). Safe for multiple concurrent thieves.
+    /// Returns Contended when losing a CAS race on a non-empty deque so callers can retry instead of sleeping.
     /// </summary>
-    public bool TrySteal(out TaskUnit task)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public StealResult TrySteal(out TaskUnit task)
     {
-        int tail = _tail;
-        Interlocked.MemoryBarrier(); // Ensure we see the latest head
-        int head = _head;
+        long tail = Volatile.Read(ref _tail.Value);
 
+        // Full fence: ensures _tail is loaded strictly before _head (pairs with TryPop's Interlocked.Exchange).
+        Interlocked.MemoryBarrier();
+
+        long head = Volatile.Read(ref _head.Value);
         if (head <= tail)
         {
             task = default;
-            return false; // Empty
+            return StealResult.Empty;
         }
 
-        // Speculatively read the task
-        task = _buffer[tail & _mask];
+        // Speculatively copy blittable TaskUnit before CAS.
+        TaskUnit candidate = _buffer[(int)(tail & _mask)];
 
-        // Try to advance tail (commit steal)
-        if (Interlocked.CompareExchange(ref _tail, tail + 1, tail) != tail)
+        if (Interlocked.CompareExchange(ref _tail.Value, tail + 1, tail) != tail)
         {
-            return false; // Lost race to another thief or the owner
+            task = default;
+            return StealResult.Contended;
         }
 
-        return true;
+        task = candidate;
+        return StealResult.Success;
     }
-    
+
     /// <summary>
-    /// Checks if the queue has any work locally.
+    /// Approximate check whether the deque currently contains work.
     /// </summary>
-    public bool HasWork => _head > _tail;
+    public bool HasWork => Volatile.Read(ref _head.Value) > Volatile.Read(ref _tail.Value);
+
+    /// <summary>
+    /// Approximate item count currently in the deque.
+    /// </summary>
+    public int ApproximateCount
+    {
+        get
+        {
+            long diff = Volatile.Read(ref _head.Value) - Volatile.Read(ref _tail.Value);
+            return diff > 0 ? (int)diff : 0;
+        }
+    }
 }

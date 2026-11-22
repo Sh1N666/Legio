@@ -5,58 +5,59 @@ namespace Legio.Core.Augurium;
 
 /// <summary>
 /// Trecenarius (The Intelligence Officer).
-/// Responsible for collecting Tesserae from the field (Circulus)
-/// and preparing the data for the Haruspex (Oracle).
+/// Collects Tesserae from the MPSC Circulus ring buffer and drains the latest statistical window
+/// for periodic Haruspex Oracle evaluation with zero heap allocations.
 /// </summary>
-public class Trecenarius
+public sealed class Trecenarius
 {
-    /// <summary>
-    /// The input buffer where Centurions drop their reports.
-    /// </summary>
     public readonly Circulus InputBuffer;
 
-    // Temporary scratchpad to hold data before sending to F# 
-    // (to avoid calling F# for every single item).
-    private readonly Tessera[] _batchCache;
-    private int _cacheCount;
-    private const int BATCH_LIMIT = 64; // How many reports to aggregate before learning
+    private readonly Tessera[] _windowBuffer;
+    private readonly int _windowCapacity;
 
-    public Trecenarius(int bufferCapacity = 4096)
+    public Trecenarius(int bufferCapacity = 4096, int windowCapacity = 512)
     {
         InputBuffer = new Circulus(bufferCapacity);
-        _batchCache = new Tessera[BATCH_LIMIT];
-        _cacheCount = 0;
+        _windowCapacity = Math.Max(32, windowCapacity);
+        _windowBuffer = new Tessera[_windowCapacity];
     }
 
     /// <summary>
-    /// Allows a Centurion to report progress.
+    /// Drops a telemetry tablet into the lock-free ring buffer.
     /// </summary>
     public void Report(in Tessera tessera)
     {
-        // Fire and forget. If buffer full, we lose data, which is acceptable for metrics.
-        InputBuffer.TryWrite(tessera);
+        InputBuffer.TryWrite(in tessera);
     }
 
     /// <summary>
-    /// The maintenance cycle called by the Sancti thread.
-    /// Drains the ring buffer and prepares a batch for the Oracle.
+    /// Drains all currently queued reports from the ring buffer, retaining up to the most recent
+    /// windowCapacity tablets so the Oracle always evaluates fresh data without stalling on stale backlog.
+    /// Zero heap allocations.
     /// </summary>
-    /// <returns>A span of collected reports, or Empty if not enough data.</returns>
     public ReadOnlySpan<Tessera> CollectOmens()
     {
-        _cacheCount = 0;
-        
-        // Drain up to BATCH_LIMIT items from the ring buffer
-        while (_cacheCount < BATCH_LIMIT && InputBuffer.TryRead(out Tessera t))
+        int totalRead = 0;
+
+        while (InputBuffer.TryRead(out Tessera t))
         {
-            _batchCache[_cacheCount++] = t;
+            if (totalRead < _windowCapacity)
+            {
+                _windowBuffer[totalRead] = t;
+            }
+            else
+            {
+                // Ring overwrite keeps the freshest tablets within the pre-allocated window.
+                _windowBuffer[totalRead % _windowCapacity] = t;
+            }
+
+            totalRead++;
         }
 
-        if (_cacheCount == 0)
-        {
+        if (totalRead == 0)
             return ReadOnlySpan<Tessera>.Empty;
-        }
 
-        return new ReadOnlySpan<Tessera>(_batchCache, 0, _cacheCount);
+        int validCount = totalRead < _windowCapacity ? totalRead : _windowCapacity;
+        return new ReadOnlySpan<Tessera>(_windowBuffer, 0, validCount);
     }
 }
