@@ -14,7 +14,7 @@ namespace Legio.Core;
 /// </summary>
 public sealed class Legatus : IDisposable
 {
-    private const int EpochRingSize = 8;
+    private const int EpochRingSize = 64;
     private const int EpochRingMask = EpochRingSize - 1;
 
     [StructLayout(LayoutKind.Explicit, Size = 64)]
@@ -301,7 +301,7 @@ public sealed class Legatus : IDisposable
 
             for (int w = 0; w < maxActiveThreads; w++)
             {
-                frame.InboxClaimed[w] = 0;
+                frame.InboxClaimed[w].Value = 0;
             }
 
             // 1. Publish phase work count and epoch with full memory barrier BEFORE waking workers.

@@ -153,19 +153,21 @@ public sealed class Centurio : IDisposable
 
         // 1. HYBRID INITIAL DISTRIBUTION:
         // Claim our contiguous initial slice and push chunks into our own Optio (strict single-owner Push).
-        if (Interlocked.CompareExchange(ref frame.InboxClaimed[Id], 1, 0) == 0)
+        if (Interlocked.CompareExchange(ref frame.InboxClaimed[Id].Value, 1, 0) == 0)
         {
             EnqueueWorkerSlice(frame, Id, recordTelemetry);
         }
 
         // 2. EXECUTION + WORK STEALING LOOP (exact phase barrier: exits only when frame.RemainingTasks == 0).
         var spin = new SpinWait();
+        int emptyPolls = 0;
         while (frame.RemainingTasks > 0)
         {
             // A. Primary: drain our local Optio (LIFO -> sequential forward memory traversal).
             if (Optio.TryPop(out TaskUnit localTask))
             {
                 ExecuteChunk(in localTask, recordTelemetry);
+                emptyPolls = 0;
                 spin.Reset();
                 continue;
             }
@@ -174,8 +176,9 @@ public sealed class Centurio : IDisposable
             if (TryStealFromLegion(maxActive, out TaskUnit stolenTask, ref phaseContentions))
             {
                 phaseSteals++;
-                Interlocked.Increment(ref _totalSteals);
+                _totalSteals++;
                 ExecuteChunk(in stolenTask, recordTelemetry);
+                emptyPolls = 0;
                 spin.Reset();
                 continue;
             }
@@ -184,16 +187,25 @@ public sealed class Centurio : IDisposable
             if (TryStealUnclaimedInbox(frame, maxActive, recordTelemetry))
             {
                 phaseSteals++;
-                Interlocked.Increment(ref _totalSteals);
+                _totalSteals++;
+                emptyPolls = 0;
                 spin.Reset();
                 continue;
             }
 
             // D. All queues are empty, waiting for peer threads to complete in-flight chunks.
-            //    sleep1Threshold: -1 prevents SpinWait from triggering a 1ms OS sleep mid-phase.
+            //    Spin briefly in pure user-space first so sub-50us multi-phase barriers avoid Linux sched_yield() storms.
             if (frame.RemainingTasks > 0)
             {
-                spin.SpinOnce(sleep1Threshold: -1);
+                if (emptyPolls < 64)
+                {
+                    emptyPolls++;
+                    Thread.SpinWait(16);
+                }
+                else
+                {
+                    spin.SpinOnce(sleep1Threshold: -1);
+                }
             }
         }
 
@@ -205,7 +217,7 @@ public sealed class Centurio : IDisposable
 
         if (phaseContentions > 0)
         {
-            Interlocked.Add(ref _totalContentions, phaseContentions);
+            _totalContentions += phaseContentions;
         }
 
         Volatile.Write(ref _activeEpoch.Value, -1);
@@ -384,8 +396,8 @@ public sealed class Centurio : IDisposable
             int victimId = startVictim + i;
             if (victimId >= maxActive) victimId -= maxActive;
 
-            if (Volatile.Read(ref frame.InboxClaimed[victimId]) == 0 &&
-                Interlocked.CompareExchange(ref frame.InboxClaimed[victimId], 1, 0) == 0)
+            if (Volatile.Read(ref frame.InboxClaimed[victimId].Value) == 0 &&
+                Interlocked.CompareExchange(ref frame.InboxClaimed[victimId].Value, 1, 0) == 0)
             {
                 EnqueueWorkerSlice(frame, victimId, recordTelemetry);
                 return true;

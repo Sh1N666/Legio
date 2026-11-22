@@ -30,8 +30,15 @@ internal sealed class PhaseFrame
         public long Value;
     }
 
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    internal struct PaddedInt
+    {
+        [FieldOffset(0)]
+        public int Value;
+    }
+
     public readonly CohortWorkItem[] Items;
-    public readonly int[] InboxClaimed;
+    public readonly PaddedInt[] InboxClaimed;
     public readonly int Slot;
 
     private PaddedLong _remainingTasks;
@@ -45,7 +52,7 @@ internal sealed class PhaseFrame
     {
         Slot = slot;
         Items = new CohortWorkItem[maxCohorts];
-        InboxClaimed = new int[maxThreads];
+        InboxClaimed = new PaddedInt[maxThreads];
     }
 
     public long RemainingTasks
