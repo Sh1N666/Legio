@@ -14,4 +14,9 @@
         <PackageReference Include="FSharp.Core" Version="10.0.100" />
     </ItemGroup>
 
+    <ItemGroup>
+      <ProjectReference Include="..\Legio.Protocol\Legio.Protocol.csproj" />
+    </ItemGroup>
+    
+
 </Project>

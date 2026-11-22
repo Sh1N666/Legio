@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8' />
+<title>Legio.Benchmark.Core.LegioVsNet-20260203-235239</title>
+
+<style type="text/css">
+	table { border-collapse: collapse; display: block; width: 100%; overflow: auto; }
+	td, th { padding: 6px 13px; border: 1px solid #ddd; text-align: right; }
+	tr { background-color: #fff; border-top: 1px solid #ccc; }
+	tr:nth-child(even) { background: #f8f8f8; }
+</style>
+</head>
+<body>
+<pre><code>
+BenchmarkDotNet v0.13.12, Freedesktop SDK 25.08 (Flatpak runtime)
+AMD Ryzen 7 7700, 1 CPU, 16 logical and 8 physical cores
+.NET SDK 10.0.100
+  [Host]     : .NET 10.0.0 (10.0.25.52411), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+  DefaultJob : .NET 10.0.0 (10.0.25.52411), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+</code></pre>
+<pre><code></code></pre>
+
+<table>
+<thead><tr><th>Method</th><th>Job </th><th>Toolchain       </th><th>ItemCount</th><th>Complexity</th><th>Mean    </th><th>Error </th><th>StdDev</th><th>Median  </th><th>Ratio</th><th>RatioSD</th><th>Allocated</th><th>Alloc Ratio</th>
+</tr>
+</thead><tbody><tr><td>Serial_Loop</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>1</td><td>3,918.0 &mu;s</td><td>26.26 &mu;s</td><td>24.57 &mu;s</td><td>3,908.2 &mu;s</td><td>1.00</td><td>0.00</td><td>-</td><td>NA</td>
+</tr><tr><td>Parallel_For</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>1</td><td>876.5 &mu;s</td><td>15.91 &mu;s</td><td>14.88 &mu;s</td><td>873.0 &mu;s</td><td>0.22</td><td>0.00</td><td>4703 B</td><td>NA</td>
+</tr><tr><td>Legio_Engine</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>1</td><td>957.0 &mu;s</td><td>18.95 &mu;s</td><td>21.06 &mu;s</td><td>951.2 &mu;s</td><td>0.24</td><td>0.01</td><td>-</td><td>NA</td>
+</tr><tr><td>Serial_Loop</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>1</td><td>3,935.2 &mu;s</td><td>51.97 &mu;s</td><td>48.61 &mu;s</td><td>3,938.5 &mu;s</td><td>1.00</td><td>0.00</td><td>-</td><td>NA</td>
+</tr><tr><td>Parallel_For</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>1</td><td>876.9 &mu;s</td><td>12.82 &mu;s</td><td>18.39 &mu;s</td><td>872.6 &mu;s</td><td>0.22</td><td>0.01</td><td>4721 B</td><td>NA</td>
+</tr><tr><td>Legio_Engine</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>1</td><td>929.0 &mu;s</td><td>17.61 &mu;s</td><td>19.57 &mu;s</td><td>930.0 &mu;s</td><td>0.24</td><td>0.01</td><td>-</td><td>NA</td>
+</tr><tr><td>Serial_Loop</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>100</td><td>1,101,584.0 &mu;s</td><td>1,554.86 &mu;s</td><td>1,378.35 &mu;s</td><td>1,101,213.3 &mu;s</td><td>1.00</td><td>0.00</td><td>-</td><td>NA</td>
+</tr><tr><td>Parallel_For</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>100</td><td>83,611.9 &mu;s</td><td>708.41 &mu;s</td><td>662.65 &mu;s</td><td>83,687.7 &mu;s</td><td>0.08</td><td>0.00</td><td>4901 B</td><td>NA</td>
+</tr><tr><td>Legio_Engine</td><td>DefaultJob</td><td>Default</td><td>1000000</td><td>100</td><td>222,579.3 &mu;s</td><td>15,397.63 &mu;s</td><td>44,178.69 &mu;s</td><td>215,822.7 &mu;s</td><td>0.23</td><td>0.04</td><td>-</td><td>NA</td>
+</tr><tr><td>Serial_Loop</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>100</td><td>1,102,314.2 &mu;s</td><td>1,176.38 &mu;s</td><td>1,100.39 &mu;s</td><td>1,102,093.4 &mu;s</td><td>1.00</td><td>0.00</td><td>-</td><td>NA</td>
+</tr><tr><td>Parallel_For</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>100</td><td>84,295.4 &mu;s</td><td>1,492.37 &mu;s</td><td>1,395.96 &mu;s</td><td>83,974.2 &mu;s</td><td>0.08</td><td>0.00</td><td>5317 B</td><td>NA</td>
+</tr><tr><td>Legio_Engine</td><td>InProcess</td><td>InProcessEmitToolchain</td><td>1000000</td><td>100</td><td>222,374.4 &mu;s</td><td>15,503.64 &mu;s</td><td>44,482.84 &mu;s</td><td>208,938.8 &mu;s</td><td>0.21</td><td>0.05</td><td>-</td><td>NA</td>
+</tr></tbody></table>
+</body>
+</html>
