@@ -192,6 +192,7 @@ public class LegatusExecutionTests
     [InlineData(OraculumModel.FuzzySugeno)]
     [InlineData(OraculumModel.OrderedFuzzyNumbers)]
     [InlineData(OraculumModel.ContextualBandit)]
+    [InlineData(OraculumModel.OnlineLinUcb)]
     public void ExecuteFrame_ZeroAllocationsOnCallingThread_AndHaruspexLoadsCleanly(OraculumModel model)
     {
         const int n = 32_768;
@@ -241,6 +242,56 @@ public class LegatusExecutionTests
     }
 
     [Fact]
+    public void InterleavedPartition_AndStealHalf_AndAffinity_ExecuteEveryElementExactlyOnce()
+    {
+        // Odd non-power-of-two item count + non-multiple batch size tests every boundary case of Interleaved & StealHalf.
+        const int itemCount = 37_123;
+        const int frames = 20;
+        var buffer = new int[itemCount];
+
+        int threads = Math.Max(2, Math.Min(8, Environment.ProcessorCount));
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            ThreadCount = threads,
+            InitialBatchSize = 137,
+            OracleIntervalMs = 5000, // Keep manual strategy active during test
+            OracleModel = OraculumModel.StaticHeuristic
+        });
+
+        var cohors = new Cohors(0, new IncrementSystem(0, buffer));
+        cohors.WriteMask.Tollere(0);
+        legatus.RegisterCohors(cohors);
+        legatus.ConstructConsilium();
+
+        // Force Option B strategy: Interleaved + StealHalf + PhysicalCoresFirst + custom Spin budget
+        var forced = new Strategia
+        {
+            BatchSize = 137,
+            ThreadCount = threads,
+            Confidence = 0.9f,
+            AffinityHint = (int)AffinityMode.PhysicalCoresFirst,
+            SpinIterationsBeforePark = 512,
+            PartitionMode = PartitionMode.Interleaved,
+            StealMode = StealMode.StealHalf
+        };
+        legatus.Scriba.Scribere(0, in forced);
+
+        for (int f = 1; f <= frames; f++)
+        {
+            legatus.ExecuteFrame();
+
+            for (int i = 0; i < itemCount; i++)
+            {
+                if (buffer[i] != f)
+                {
+                    Assert.Fail($"Interleaved/StealHalf frame {f}: index {i} expected {f}, got {buffer[i]}.");
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void Dispose_CleanlyShutsDownRepeatedInstances_WithoutHanging()
     {
         var buffer = new int[4096];
@@ -252,7 +303,7 @@ public class LegatusExecutionTests
                 MaxCohorts = 4,
                 ThreadCount = Math.Min(4, Environment.ProcessorCount),
                 OracleIntervalMs = 20,
-                OracleModel = (OraculumModel)(round % 4)
+                OracleModel = (OraculumModel)(round % 5)
             });
 
             var cohors = new Cohors(0, new IncrementSystem(0, buffer));
@@ -268,22 +319,36 @@ public class LegatusExecutionTests
     }
 
     [Fact]
-    public void Speculator_Explorare_IsZeroAllocationOnLinux()
+    public void Speculator_Explorare_IsZeroAllocationOnLinux_AndSamplesSystemAndPmuTelemetry()
     {
         if (!OperatingSystem.IsLinux())
             return;
 
         using var speculator = new Legio.Core.Augurium.Speculator(updateIntervalMs: 10);
+        // Burn a tiny amount of CPU so counters advance
+        double acc = 0.0;
+        for (int i = 0; i < 200_000; i++) acc += Math.Sqrt(i);
+
         // Warmup
         Thread.Sleep(15);
         speculator.Explorare();
 
+        for (int i = 0; i < 200_000; i++) acc += Math.Sqrt(i + 1);
         Thread.Sleep(15);
+
         long before = GC.GetAllocatedBytesForCurrentThread();
         speculator.Explorare();
         long after = GC.GetAllocatedBytesForCurrentThread();
 
         Assert.Equal(0L, after - before);
         Assert.InRange(speculator.ProcessCpuLoad, 0.0f, 1.0f);
+        Assert.InRange(speculator.ExternalCpuLoad, 0.0f, 1.0f);
+        Assert.True(speculator.HasExternalCpu, "Expected /proc/stat external CPU telemetry to initialize on Linux.");
+        if (speculator.HasPmuCounters)
+        {
+            Assert.InRange(speculator.InstructionsPerCycle, 0.0f, 8.0f);
+            Assert.InRange(speculator.CacheMissRate, 0.0f, 1.0f);
+        }
+        Assert.True(acc > 0.0);
     }
 }
