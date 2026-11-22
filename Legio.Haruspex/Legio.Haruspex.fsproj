@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <TargetFramework>net10.0</TargetFramework> <GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -7,6 +7,13 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="FuzzyTypes.fs" />
+        <Compile Include="TelemetryFeatures.fs" />
+        <Compile Include="Models/StaticHeuristicModel.fs" />
+        <Compile Include="Models/FuzzySugenoModel.fs" />
+        <Compile Include="Models/OrderedFuzzyModel.fs" />
+        <Compile Include="Models/ContextualBanditModel.fs" />
+        <Compile Include="Models/OnlineLinUcbModel.fs" />
         <Compile Include="Oraculum.fs" />
     </ItemGroup>
 

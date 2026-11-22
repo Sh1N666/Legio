@@ -13,7 +13,7 @@ namespace Legio.Core.Executio;
 /// adaptive StealMode (StealOne/StealHalf), OS thread affinity pinning, adaptive spin budget,
 /// and zero-allocation aggregated phase telemetry (including BarrierWaitTicks and spatial half-ticks).
 /// </summary>
-public sealed unsafe class Centurio : IDisposable
+public sealed class Centurio : IDisposable
 {
     private const int DefaultSpinIterationsBeforePark = 1024;
 
@@ -576,62 +576,7 @@ public sealed unsafe class Centurio : IDisposable
 
     private void ApplyThreadAffinity(int affinityHint)
     {
-        try
-        {
-            int logicalCores = Math.Max(1, Mensor.Result.LogicalCoreCount);
-
-            if (OperatingSystem.IsLinux())
-            {
-                byte* mask = stackalloc byte[128];
-                new Span<byte>(mask, 128).Clear();
-
-                if (affinityHint == (int)AffinityMode.PhysicalCoresFirst)
-                {
-                    int cpu = Mensor.GetPreferredCpuId(Id);
-                    if ((uint)cpu < 1024u)
-                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
-                }
-                else if (affinityHint == (int)AffinityMode.PinnedAllLogical)
-                {
-                    int cpu = Id % logicalCores;
-                    if ((uint)cpu < 1024u)
-                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
-                }
-                else
-                {
-                    int count = Math.Min(logicalCores, 1024);
-                    for (int cpu = 0; cpu < count; cpu++)
-                        mask[cpu >> 3] |= (byte)(1 << (cpu & 7));
-                }
-
-                LinuxSchedSetAffinity(0, 128, mask);
-            }
-            else if (OperatingSystem.IsWindows())
-            {
-                int limit = Math.Min(logicalCores, 64);
-                ulong maskBits;
-                if (affinityHint == (int)AffinityMode.PhysicalCoresFirst)
-                {
-                    int cpu = Mensor.GetPreferredCpuId(Id) % limit;
-                    maskBits = 1UL << cpu;
-                }
-                else if (affinityHint == (int)AffinityMode.PinnedAllLogical)
-                {
-                    int cpu = Id % limit;
-                    maskBits = 1UL << cpu;
-                }
-                else
-                {
-                    maskBits = limit == 64 ? ulong.MaxValue : ((1UL << limit) - 1UL);
-                }
-
-                SetThreadAffinityMask(GetCurrentThread(), (nuint)maskBits);
-            }
-        }
-        catch
-        {
-            // Ignore affinity failures in restricted containers / cgroups
-        }
+        ThreadAffinity.Apply(Id, affinityHint);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -704,13 +649,4 @@ public sealed unsafe class Centurio : IDisposable
             _wakeEvent?.Dispose();
         }
     }
-
-    [DllImport("libc", EntryPoint = "sched_setaffinity", ExactSpelling = true)]
-    private static extern int LinuxSchedSetAffinity(int pid, nuint cpusetsize, void* mask);
-
-    [DllImport("kernel32.dll", ExactSpelling = true)]
-    private static extern IntPtr GetCurrentThread();
-
-    [DllImport("kernel32.dll", ExactSpelling = true)]
-    private static extern nuint SetThreadAffinityMask(IntPtr hThread, nuint dwThreadAffinityMask);
 }
