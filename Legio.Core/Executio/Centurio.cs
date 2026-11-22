@@ -152,6 +152,7 @@ public sealed unsafe class Centurio : IDisposable
         // Honor the ML model's ThreadCount: idle workers do not steal from phases with fewer active threads.
         if (Id >= maxActive)
         {
+            DrainResidualOptio();
             Volatile.Write(ref _activeEpoch.Value, -1);
             return;
         }
@@ -200,7 +201,7 @@ public sealed unsafe class Centurio : IDisposable
                     waitStartTicks = 0;
                 }
 
-                ExecuteChunk(in localTask, frame, recordTelemetry);
+                ExecuteChunk(in localTask, recordTelemetry && localTask.PhaseSlot == frame.Slot);
                 emptyPolls = 0;
                 spin.Reset();
                 continue;
@@ -215,7 +216,7 @@ public sealed unsafe class Centurio : IDisposable
                     waitStartTicks = 0;
                 }
 
-                ExecuteChunk(in stolenTask, frame, recordTelemetry);
+                ExecuteChunk(in stolenTask, recordTelemetry && stolenTask.PhaseSlot == frame.Slot);
                 emptyPolls = 0;
                 spin.Reset();
                 continue;
@@ -257,6 +258,9 @@ public sealed unsafe class Centurio : IDisposable
             }
         }
 
+        // Invariant: NEVER exit a phase leaving any task (e.g., cross-epoch stolen chunk) stranded in our local Optio.
+        DrainResidualOptio();
+
         if (waitStartTicks != 0)
         {
             phaseBarrierWaitTicks += Stopwatch.GetTimestamp() - waitStartTicks;
@@ -274,6 +278,15 @@ public sealed unsafe class Centurio : IDisposable
         }
 
         Volatile.Write(ref _activeEpoch.Value, -1);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void DrainResidualOptio()
+    {
+        while (Optio.TryPop(out TaskUnit strayTask))
+        {
+            ExecuteChunk(in strayTask, recordTelemetry: false);
+        }
     }
 
     private void EnqueueWorkerSlice(PhaseFrame frame, int targetWorkerId, bool recordTelemetry)
@@ -319,7 +332,7 @@ public sealed unsafe class Centurio : IDisposable
 
                     if (!Optio.TryPush(in unit))
                     {
-                        ExecuteChunk(in unit, frame, recordTelemetry);
+                        ExecuteChunk(in unit, recordTelemetry);
                     }
                 }
             }
@@ -352,7 +365,7 @@ public sealed unsafe class Centurio : IDisposable
 
                     if (!Optio.TryPush(in unit))
                     {
-                        ExecuteChunk(in unit, frame, recordTelemetry);
+                        ExecuteChunk(in unit, recordTelemetry);
                     }
                 }
             }
@@ -360,16 +373,17 @@ public sealed unsafe class Centurio : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ExecuteChunk(in TaskUnit task, PhaseFrame frame, bool recordTelemetry)
+    private void ExecuteChunk(in TaskUnit task, bool recordTelemetry)
     {
         IPriorPilus commander = _legatus.GetCommander(task.CohortSlot);
+        PhaseFrame ownerFrame = _legatus.GetPhaseFrameBySlot(task.PhaseSlot);
 
         if (recordTelemetry)
         {
             long startTicks = Stopwatch.GetTimestamp();
             commander.ExecuteBatch(task.Start, task.Length);
             long elapsed = Stopwatch.GetTimestamp() - startTicks;
-            bool isFirstHalf = task.Start < frame.CohortHalfBoundary[task.CohortSlot];
+            bool isFirstHalf = task.Start < ownerFrame.CohortHalfBoundary[task.CohortSlot];
             AccumulateTelemetry(task.CohortSlot, elapsed, task.Length, isFirstHalf);
         }
         else
@@ -378,7 +392,7 @@ public sealed unsafe class Centurio : IDisposable
         }
 
         _totalTasksExecuted++;
-        _legatus.GetPhaseFrameBySlot(task.PhaseSlot).DecrementRemainingTasks();
+        ownerFrame.DecrementRemainingTasks();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -488,7 +502,9 @@ public sealed unsafe class Centurio : IDisposable
 
                     // Option B.2 (StealHalf): amortize CAS overhead by pulling up to half of victim's remaining
                     // backlog (capped at 7 extra chunks) into our empty local Optio deque.
-                    if (stealMode == StealMode.StealHalf)
+                    // CRITICAL: only batch-steal chunks belonging to our exact current phase (frame.Slot) so a
+                    // late worker from epoch E can never stash epoch E+1 chunks into its local Optio and park!
+                    if (stealMode == StealMode.StealHalf && stolenTask.PhaseSlot == frame.Slot)
                     {
                         int victimRemaining = victimOptio.ApproximateCount;
                         int extraTarget = Math.Min(7, victimRemaining >> 1);
@@ -499,9 +515,16 @@ public sealed unsafe class Centurio : IDisposable
                             {
                                 phaseSteals++;
                                 _totalSteals++;
+                                if (extraUnit.PhaseSlot != frame.Slot)
+                                {
+                                    // Victim moved to a newer phase: complete this chunk immediately and stop batch-stealing.
+                                    ExecuteChunk(in extraUnit, recordTelemetry: false);
+                                    break;
+                                }
+
                                 if (!Optio.TryPush(in extraUnit))
                                 {
-                                    ExecuteChunk(in extraUnit, frame, recordTelemetry);
+                                    ExecuteChunk(in extraUnit, recordTelemetry);
                                     break;
                                 }
                             }

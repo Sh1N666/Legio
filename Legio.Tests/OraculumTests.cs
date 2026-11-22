@@ -260,10 +260,13 @@ public class OraculumTests
         var omens = new Tessera[2];
         int interleavedChosenInSkewRegime = 0;
         int contiguousChosenInUniformRegime = 0;
+        int skewChecks = 0;
+        int uniformChecks = 0;
 
-        for (int step = 0; step < 80; step++)
+        for (int step = 0; step < 100; step++)
         {
-            bool skewedRegime = (step % 2) == 0;
+            // Hold each regime for 5 consecutive oracle windows (mirroring real shifting workloads like DynamicLoadWave).
+            bool skewedRegime = ((step / 5) % 2) == 0;
             SystemTelemetry sys = MakeSys(processCpu: 0.5f, externalCpu: 0.05f, ipc: skewedRegime ? 1.8f : 2.6f, cacheMissRate: 0.08f);
 
             long durTicks;
@@ -317,18 +320,26 @@ public class OraculumTests
             engine.Evaluate(in topo, in sys, omens, strategies, updated);
             current = strategies[0];
 
-            // Measure post-exploration accuracy (last 30 steps)
-            if (step >= 50)
+            // Measure post-exploration contextual accuracy (last 40 steps: 20 skewed + 20 uniform)
+            if (step >= 60)
             {
-                if (skewedRegime && current.PartitionMode == PartitionMode.Interleaved)
-                    interleavedChosenInSkewRegime++;
-                if (!skewedRegime && current.PartitionMode == PartitionMode.Contiguous)
-                    contiguousChosenInUniformRegime++;
+                if (skewedRegime)
+                {
+                    skewChecks++;
+                    if (current.PartitionMode == PartitionMode.Interleaved)
+                        interleavedChosenInSkewRegime++;
+                }
+                else
+                {
+                    uniformChecks++;
+                    if (current.PartitionMode == PartitionMode.Contiguous)
+                        contiguousChosenInUniformRegime++;
+                }
             }
         }
 
-        Assert.True(interleavedChosenInSkewRegime >= 10, $"Expected LinUCB to prefer Interleaved in skewed regime, got {interleavedChosenInSkewRegime}/15.");
-        Assert.True(contiguousChosenInUniformRegime >= 10, $"Expected LinUCB to prefer Contiguous in uniform regime, got {contiguousChosenInUniformRegime}/15.");
+        Assert.True(interleavedChosenInSkewRegime >= 14, $"Expected LinUCB to prefer Interleaved in skewed regime, got {interleavedChosenInSkewRegime}/{skewChecks}.");
+        Assert.True(contiguousChosenInUniformRegime >= 14, $"Expected LinUCB to prefer Contiguous in uniform regime, got {contiguousChosenInUniformRegime}/{uniformChecks}.");
     }
 
     [Theory]

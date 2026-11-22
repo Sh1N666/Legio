@@ -292,6 +292,62 @@ public class LegatusExecutionTests
     }
 
     [Fact]
+    public void StealHalf_WithRapidlyChangingThreadCount_NeverDeadlocks()
+    {
+        // Regression test: exercises rapid ThreadCount shrinkage (16 -> 3 -> 8 -> 2 -> 16)
+        // combined with StealHalf + Interleaved across 150 back-to-back 2-phase frames.
+        const int n = 24_576;
+        var a = new int[n];
+        var b = new int[n];
+
+        int maxT = Math.Max(4, Math.Min(16, Environment.ProcessorCount));
+        using var legatus = new Legatus(new LegatusConfig
+        {
+            MaxCohorts = 4,
+            ThreadCount = maxT,
+            InitialBatchSize = 64,
+            OracleIntervalMs = 5000,
+            OracleModel = OraculumModel.StaticHeuristic
+        });
+
+        var c0 = new Cohors(0, new IncrementSystem(0, a));
+        c0.WriteMask.Tollere(0);
+        var c1 = new Cohors(1, new PipelineStageSystem(1, a, b, static x => x * 2));
+        c1.ReadMask.Tollere(0);
+        c1.WriteMask.Tollere(1);
+
+        legatus.RegisterCohors(c0);
+        legatus.RegisterCohors(c1);
+        legatus.ConstructConsilium();
+
+        int[] threadSchedule = [maxT, 3, maxT, 2, Math.Max(2, maxT / 2), 1, maxT, 3];
+        for (int f = 1; f <= 150; f++)
+        {
+            int t0 = threadSchedule[f % threadSchedule.Length];
+            int t1 = threadSchedule[(f + 1) % threadSchedule.Length];
+
+            var s0 = new Strategia
+            {
+                BatchSize = 64,
+                ThreadCount = t0,
+                Confidence = 0.9f,
+                AffinityHint = 0,
+                SpinIterationsBeforePark = 512,
+                PartitionMode = (f & 1) == 0 ? PartitionMode.Interleaved : PartitionMode.Contiguous,
+                StealMode = StealMode.StealHalf
+            };
+            var s1 = s0;
+            s1.ThreadCount = t1;
+
+            legatus.Scriba.Scribere(0, in s0);
+            legatus.Scriba.Scribere(1, in s1);
+            legatus.ExecuteFrame();
+        }
+
+        Assert.All(b, v => Assert.Equal(300, v));
+    }
+
+    [Fact]
     public void Dispose_CleanlyShutsDownRepeatedInstances_WithoutHanging()
     {
         var buffer = new int[4096];
